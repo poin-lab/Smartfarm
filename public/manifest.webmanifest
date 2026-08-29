@@ -1,0 +1,22 @@
+{
+  "name": "GREEN LINK 스마트팜",
+  "short_name": "GREEN LINK",
+  "description": "컨테이너 스마트팜 환경 모니터링 및 농장 토큰 관리",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f3f6f4",
+  "theme_color": "#103d2a",
+  "lang": "ko-KR",
+  "categories": ["business", "productivity"],
+  "icons": [
+    {
+      "src": "/icons/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

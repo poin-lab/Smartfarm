@@ -1,0 +1,6 @@
+# 구분 | 이메일 | 비밀번호
+# 구분은 관리자, 일반, 농장주만 사용할 수 있습니다.
+
+관리자 | admin@smartfarm.kr | admin1234
+농장주 | farmer@smartfarm.kr | farmer1234
+일반 | user@smartfarm.kr | user1234

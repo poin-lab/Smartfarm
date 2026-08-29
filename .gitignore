@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+.npm-cache
+server/data/*.sqlite*
+backups
+*.tsbuildinfo
+.DS_Store
