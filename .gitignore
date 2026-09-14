@@ -1,8 +1,40 @@
-node_modules
-dist
-.env
-.npm-cache
-server/data/*.sqlite*
-backups
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+.npm-cache/
 *.tsbuildinfo
+npm-debug.log*
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Runtime data
+.run/
+server/data/
+backups/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+
+# Hyperledger Fabric generated files and local identities
+blockchain/bin/
+blockchain/builders/
+blockchain/organizations/
+blockchain/compose/crypto-config/
+blockchain/compose/.env
+blockchain/channel_artifacts/
+blockchain/chaincode/chaincode
+blockchain/chaincode/vendor/
+blockchain/*.tar.gz
+
+# Editor and operating-system files
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

@@ -3,9 +3,7 @@ import {
   Activity,
   Camera,
   Cpu,
-  DatabaseZap,
   FileCheck2,
-  Link2,
   Radio,
   Send,
 } from "lucide-react";
@@ -15,8 +13,6 @@ import type {
   Container,
   Device,
   LedgerBlock,
-  PublicChainOperation,
-  PublicChainStatus,
 } from "../model";
 
 function useAdminData<T>(path: string, refresh: number) {
@@ -39,18 +35,10 @@ export function AdminOperations({
   const summary = useAdminData<AdminSummary>("/admin/summary", refresh);
   const devices = useAdminData<Device[]>("/admin/iot/devices", refresh);
   const containers = useAdminData<Container[]>("/containers", refresh);
-  const chain = useAdminData<PublicChainStatus>(
-    "/public-chain/status",
-    refresh,
-  );
-  const chainOperations = useAdminData<PublicChainOperation[]>(
-    "/public-chain/operations?limit=20",
-    refresh,
-  );
   const ledger = useAdminData<{
     verification: { valid: boolean; count: number };
     blocks: LedgerBlock[];
-  }>("/blockchain/blocks?limit=20", refresh);
+  }>("/ledger/blocks?limit=20", refresh);
   const reload = () => setRefresh((value) => value + 1);
   async function provision(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -103,40 +91,6 @@ export function AdminOperations({
       notify((error as Error).message);
     }
   }
-  async function anchor(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const values = Object.fromEntries(new FormData(form));
-    try {
-      const result = await api<{ readingCount: number; merkleRoot: string }>(
-        "/admin/public-chain/sensor-batches",
-        { method: "POST", body: JSON.stringify(values) },
-      );
-      notify(
-        `${result.readingCount}개 센서 기록의 Merkle root를 outbox에 등록했습니다.`,
-      );
-      form.reset();
-      reload();
-    } catch (error) {
-      notify((error as Error).message);
-    }
-  }
-  async function processChain() {
-    try {
-      const result = await api<{ status: string; txHash?: string }>(
-        "/admin/public-chain/process-next",
-        { method: "POST" },
-      );
-      notify(
-        result.txHash
-          ? `퍼블릭 체인 확정: ${result.txHash}`
-          : `Outbox 상태: ${result.status}`,
-      );
-      reload();
-    } catch (error) {
-      notify((error as Error).message);
-    }
-  }
   return (
     <section className="ops-console">
       <div className="admin-stats">
@@ -165,29 +119,6 @@ export function AdminOperations({
           </span>
         </div>
       </div>
-      <section
-        className={`chain-status ${chain?.enabled ? "enabled" : "disabled"}`}
-      >
-        <div>
-          <Link2 />
-          <span>
-            <strong>퍼블릭 체인 {chain?.enabled ? "연결됨" : "비활성"}</strong>
-            <small>
-              {chain?.enabled
-                ? `${chain.chainName} · Chain ID ${chain.chainId} · 릴레이어 ${chain.relayerEnabled ? "활성" : "미설정"}`
-                : "RPC·컨트랙트 환경변수가 필요합니다."}
-            </small>
-          </span>
-        </div>
-        <button
-          className="outline-btn"
-          onClick={processChain}
-          disabled={!chain?.relayerEnabled}
-        >
-          <DatabaseZap />
-          다음 Outbox 처리
-        </button>
-      </section>
       <div className="ops-grid">
         <form onSubmit={provision}>
           <h2>
@@ -294,39 +225,6 @@ export function AdminOperations({
             <Send /> 명령 전송
           </button>
         </form>
-        <form onSubmit={anchor}>
-          <h2>
-            <Link2 /> 센서 배치 Anchor
-          </h2>
-          <label className="field">
-            컨테이너
-            <select name="containerId" required>
-              <option value="">선택</option>
-              {containers?.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            최대 기록 수
-            <input
-              name="maxReadings"
-              type="number"
-              min="1"
-              max="500"
-              defaultValue="100"
-            />
-          </label>
-          <p>
-            센서 원본은 DB에 유지하고 Merkle root만 퍼블릭 체인 outbox에
-            등록합니다.
-          </p>
-          <button className="primary-btn">
-            <Link2 /> Anchor 생성
-          </button>
-        </form>
       </div>
       <div className="ops-grid">
         <article className="ops-table">
@@ -348,36 +246,8 @@ export function AdminOperations({
           )}
         </article>
         <article className="ops-table">
-          <h2>퍼블릭 체인 Outbox</h2>
-          {chainOperations?.length ? (
-            chainOperations.map((item) => (
-              <div key={item.id}>
-                <span>
-                  {item.operationType}
-                  <small>
-                    {item.entityId} · 시도 {item.attempts}회
-                  </small>
-                </span>
-                <b
-                  className={
-                    item.status === "confirmed"
-                      ? "healthy"
-                      : item.status === "failed"
-                        ? "danger-text"
-                        : ""
-                  }
-                >
-                  {item.status}
-                </b>
-              </div>
-            ))
-          ) : (
-            <p>대기 중인 퍼블릭 체인 작업이 없습니다.</p>
-          )}
-        </article>
-        <article className="ops-table">
           <h2>
-            위변조 검증형 사설 원장{" "}
+            위변조 검증형 감사 원장{" "}
             <b
               className={ledger?.verification.valid ? "healthy" : "danger-text"}
             >

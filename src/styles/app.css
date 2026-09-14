@@ -36,8 +36,8 @@ button {
   color: inherit;
 }
 button:disabled {
-  opacity: 0.6;
-  cursor: wait;
+  opacity: 1;
+  cursor: not-allowed;
 }
 h1,
 h2,
@@ -121,9 +121,12 @@ textarea:focus {
   gap: 8px;
   transition: 0.2s;
 }
-.primary-btn:hover {
+.primary-btn:hover:not(:disabled) {
   background: #105d34;
   transform: translateY(-1px);
+}
+.primary-btn:disabled {
+  transform: none;
 }
 .outline-btn {
   height: 42px;
@@ -1543,6 +1546,30 @@ textarea:focus {
   line-height: 1.55;
   height: 35px;
 }
+.farm-card-role {
+  margin: 8px 0 2px;
+}
+.role-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 4px 9px;
+  border-radius: 999px;
+}
+.role-badge svg {
+  width: 11px;
+  height: 11px;
+}
+.role-badge.role-owner {
+  background: #eaf6ee;
+  color: var(--green);
+}
+.role-badge.role-investor {
+  background: #fff6e5;
+  color: #b8860b;
+}
 .farm-card-body > div {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -2318,6 +2345,27 @@ textarea:focus {
   width: 100%;
   min-height: 40px;
   font-size: 11px;
+}
+.order-owned-banner {
+  width: 100%;
+  min-height: 40px;
+  margin-top: 18px;
+  border: 1px solid #cfe2d7;
+  border-radius: 10px;
+  background: #f6faf7;
+  color: #315a44;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: default;
+  user-select: none;
+}
+.order-owned-banner svg {
+  width: 17px;
+  height: 17px;
 }
 .wallet-hero {
   background: linear-gradient(120deg, #113e2c, #286e49);
@@ -4076,121 +4124,6 @@ textarea:focus-visible {
 .ops-console {
   margin-top: 24px;
 }
-.chain-status,
-.wallet-link {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  background: #fff;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 18px 20px;
-  margin-top: 14px;
-}
-.chain-status > div,
-.wallet-link > div {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-}
-.chain-status svg,
-.wallet-link svg {
-  width: 20px;
-  color: var(--green);
-}
-.chain-status span,
-.wallet-link span {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.chain-status small,
-.wallet-link small {
-  color: var(--muted);
-  font-size: 10px;
-  word-break: break-all;
-}
-.chain-status.enabled {
-  border-color: #80c99a;
-  background: #f4fbf6;
-}
-.chain-status.disabled {
-  border-color: #e5c881;
-  background: #fffaf0;
-}
-.wallet-link {
-  margin-top: 18px;
-}
-.public-market {
-  background: #f4fbf6;
-  border: 1px solid #8dcc9f;
-  border-radius: 16px;
-  padding: 20px;
-  margin: 0 0 20px;
-}
-.public-market.disabled {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  background: #fffaf0;
-  border-color: #e5c881;
-}
-.public-market > header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 16px;
-}
-.public-market > header > div {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-.public-market header span {
-  display: flex;
-  flex-direction: column;
-}
-.public-market header small,
-.public-market p {
-  font-size: 10px;
-  color: var(--muted);
-  line-height: 1.5;
-}
-.public-market header a {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--green);
-  font-size: 11px;
-  font-weight: 700;
-}
-.public-market svg {
-  width: 19px;
-}
-.public-market-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-}
-.public-market-grid > div,
-.public-market-grid > form {
-  background: #fff;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 16px;
-}
-.public-market-grid h3 {
-  font-size: 13px;
-  margin-bottom: 10px;
-}
-.public-market-grid p {
-  margin-bottom: 12px;
-}
-.wallet-link > p {
-  font-size: 11px;
-  color: var(--muted);
-}
 .ops-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -4260,23 +4193,6 @@ textarea:focus-visible {
   .ops-table,
   .ops-table:last-child {
     grid-column: auto;
-  }
-  .chain-status,
-  .wallet-link {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-  .public-market-grid {
-    grid-template-columns: 1fr;
-  }
-  .public-market > header {
-    align-items: flex-start;
-    gap: 10px;
-    flex-direction: column;
-  }
-  .chain-status button,
-  .wallet-link button {
-    width: 100%;
   }
 }
 

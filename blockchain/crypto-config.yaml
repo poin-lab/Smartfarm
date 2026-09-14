@@ -1,0 +1,16 @@
+# my-network/crypto-config.yaml 예시 구조
+OrdererOrgs: # 오더러 조직 정의  // 블럭순서를 정하는 곳
+  - Name: Orderer
+    Domain: smartfarm.com
+    EnableNodeOUs: true
+    Specs:
+      - Hostname: orderer
+
+PeerOrgs: # 피어 조직 정의 // 실제 스마트 컨트랙트가 배포되고 트랜잭션이 발생하는 곳 //가용성
+  - Name: Org1
+    Domain: org1.smartfarm.com
+    EnableNodeOUs: true
+    Template:
+      Count: 1 # 피어 개수
+    Users:
+      Count: 1 # 유저 개수

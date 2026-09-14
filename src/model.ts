@@ -5,7 +5,6 @@ export type User = {
   role: "user" | "admin";
   status: "active" | "suspended" | "withdrawn";
   phone: string;
-  walletAddress?: string | null;
   mockCreditBalance?: number;
 };
 export type Farm = {
@@ -39,11 +38,16 @@ export type Container = {
   lastExecutionPrice?: number | null;
   issuerId?: string | null;
   tokenStatus?: "requested" | "approved" | "issued" | "suspended";
-  executionVenue?: "INTERNAL" | "BROKER" | "PUBLIC_CHAIN";
-  publicChainTokenId?: string;
+  executionVenue?: "INTERNAL" | "BROKER";
   rackViews?: RackView[];
   updatedAt?: string;
   farm?: Farm;
+  // Only present on GET /containers?owner=me: whether the current viewer
+  // operates this container's farm, and how many of its tokens they hold.
+  // Holding tokens doesn't grant management rights — see
+  // DATABASE_BLOCKCHAIN_DESIGN.md's operator/issuer/holder role split.
+  viewerIsOwner?: boolean;
+  viewerHoldingQuantity?: number;
 };
 export type RackView = {
   id: string;
@@ -64,6 +68,7 @@ export type Sensor = {
 };
 export type Order = {
   id: string;
+  sellerId: string;
   tokenId: string;
   containerId: string;
   sellerName: string;
@@ -114,7 +119,7 @@ export type TokenOrder = {
     | "filled"
     | "cancelled"
     | "rejected";
-  executionVenue: "INTERNAL" | "BROKER" | "PUBLIC_CHAIN";
+  executionVenue: "INTERNAL" | "BROKER";
   externalOrderId: string | null;
   idempotencyKey: string | null;
   legacyOrderId: string | null;
@@ -143,7 +148,7 @@ export type TradingInstrument = {
   currency: "MOCK_KRW";
   totalSupply: number;
   initialPrice: number;
-  executionVenue: "INTERNAL" | "BROKER" | "PUBLIC_CHAIN";
+  executionVenue: "INTERNAL" | "BROKER";
   status: "requested" | "approved" | "issued" | "suspended";
 };
 export type TokenQuote = {
@@ -166,7 +171,7 @@ export type TokenRequest = {
   totalSupply: number;
   initialPrice: number;
   status: "requested" | "approved" | "issued" | "suspended";
-  executionVenue: "INTERNAL" | "BROKER" | "PUBLIC_CHAIN";
+  executionVenue: "INTERNAL" | "BROKER";
   createdAt: string;
   updatedAt: string;
 };
@@ -231,28 +236,4 @@ export type AdminSummary = {
   onlineDevices: number;
   queuedCommands: number;
   ledgerBlocks: number;
-};
-export type PublicChainStatus = {
-  enabled: boolean;
-  relayerEnabled: boolean;
-  chainId: number;
-  chainName: string;
-  assetAddress: string | null;
-  marketplaceAddress: string | null;
-  explorerUrl: string | null;
-  relayerAddress: string | null;
-  mode: "evm" | "disabled";
-};
-export type PublicChainOperation = {
-  id: string;
-  operationType: string;
-  entityType: string;
-  entityId: string;
-  status: string;
-  txHash: string | null;
-  blockNumber: number | null;
-  attempts: number;
-  error: string | null;
-  createdAt: string;
-  updatedAt: string;
 };

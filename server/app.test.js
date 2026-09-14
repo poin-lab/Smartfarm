@@ -1,10 +1,18 @@
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
 import { createStore } from "./store.js";
-import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
-const setup = () => createApp({ store: createStore(":memory:") });
+// setup() doesn't hand the store back to the test, so it can't close it
+// itself; each one runs against a real, throwaway PostgreSQL schema (unlike
+// SQLite's in-memory mode) that must still be dropped when the suite ends.
+const untrackedStores = [];
+const setup = () => {
+  const store = createStore(":memory:");
+  untrackedStores.push(store);
+  return createApp({ store });
+};
+afterAll(() => Promise.all(untrackedStores.map((store) => store.close())));
 const sessionFrom = (response) => {
   const cookie = response.headers["set-cookie"]?.[0] || "";
   const value = cookie.match(/(?:__Host-)?green_link_session=([^;]+)/)?.[1];
@@ -21,6 +29,43 @@ describe("Smart Farm API", () => {
     expect(res.status).toBe(200);
     expect(res.body[0].containerCount).toBe(3);
   });
+  it("shows farms I operate and containers I've invested in under owner=me", async () => {
+    const app = setup();
+    const adminToken = await login(app, "admin@smartfarm.kr", "admin1234");
+    const adminContainers = await request(app)
+      .get("/api/containers?owner=me")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(adminContainers.status).toBe(200);
+    expect(adminContainers.body.map((item) => item.id)).toEqual([
+      "b-01",
+      "c-01",
+    ]);
+    expect(adminContainers.body.every((item) => item.viewerIsOwner)).toBe(
+      true,
+    );
+
+    // u1 owns no farm but holds SFC-A01/SFC-A02/SFC-B01 (see fixtures in
+    // server/database.js) — those containers should still show up here as
+    // investments, just without viewerIsOwner (management stays with
+    // farm.owner_id; see DATABASE_BLOCKCHAIN_DESIGN.md's role separation).
+    const userToken = await login(app, "user@smartfarm.kr", "user1234");
+    const userContainers = await request(app)
+      .get("/api/containers?owner=me")
+      .set("Authorization", `Bearer ${userToken}`);
+    expect(userContainers.status).toBe(200);
+    expect(userContainers.body.map((item) => item.id)).toEqual([
+      "a-01",
+      "a-02",
+      "b-01",
+    ]);
+    expect(userContainers.body.every((item) => !item.viewerIsOwner)).toBe(
+      true,
+    );
+    expect(
+      userContainers.body.find((item) => item.id === "a-01")
+        .viewerHoldingQuantity,
+    ).toBe(4);
+  });
   it("authenticates and protects wallet", async () => {
     const app = setup();
     expect((await request(app).get("/api/wallet")).status).toBe(401);
@@ -32,21 +77,64 @@ describe("Smart Farm API", () => {
     expect(res.body.totalTokens).toBe(7);
     expect(res.body.positions[0]).toHaveProperty("settledQuantity");
   });
-  it("backfills farm-owner issuers, positions and canonical token orders", () => {
+  it("keeps tab-scoped bearer sessions from being overwritten by a shared cookie", async () => {
+    const store = createStore(":memory:");
+    const app = createApp({ store });
+    const userLogin = await request(app)
+      .post("/api/auth/login")
+      .send({ email: "user@smartfarm.kr", password: "user1234" });
+    const adminLogin = await request(app)
+      .post("/api/auth/login")
+      .send({ email: "admin@smartfarm.kr", password: "admin1234" });
+
+    expect(userLogin.body.sessionToken).toEqual(expect.any(String));
+    expect(adminLogin.body.sessionToken).toEqual(expect.any(String));
+
+    const created = await request(app)
+      .post("/api/orders")
+      .set("Cookie", adminLogin.headers["set-cookie"])
+      .set("Authorization", `Bearer ${userLogin.body.sessionToken}`)
+      .set("X-Green-Link-Request", "1")
+      .send({ tokenId: "SFC-A01", quantity: 1, unitPrice: 121000 });
+
+    expect(created.status).toBe(201);
+    expect(created.body.sellerId).toBe("u1");
+
+    const purchased = await request(app)
+      .post(`/api/orders/${created.body.id}/purchase`)
+      .set("Cookie", userLogin.headers["set-cookie"])
+      .set("Authorization", `Bearer ${adminLogin.body.sessionToken}`)
+      .set("X-Green-Link-Request", "1")
+      .send({ quantity: 1 });
+
+    expect(purchased.status).toBe(201);
+
+    expect(
+      await store.db
+        .prepare(
+          "SELECT buyer_id,seller_id FROM token_executions WHERE sell_order_id=?",
+        )
+        .get(created.body.id),
+    ).toMatchObject({ buyer_id: "admin", seller_id: "u1" });
+    await store.close();
+  });
+  it("backfills farm-owner issuers, positions and canonical token orders", async () => {
     const store = createStore(":memory:");
     expect(
-      store.db.prepare("SELECT owner_id FROM farms WHERE id='farm-a'").get()
+      (await store.db.prepare("SELECT owner_id FROM farms WHERE id='farm-a'").get())
         .owner_id,
     ).toBe("farmer-a");
     expect(
-      store.db
-        .prepare(
-          "SELECT issuer_id FROM container_tokens WHERE container_id='a-01'",
-        )
-        .get().issuer_id,
+      (
+        await store.db
+          .prepare(
+            "SELECT issuer_id FROM container_tokens WHERE container_id='a-01'",
+          )
+          .get()
+      ).issuer_id,
     ).toBe("farmer-a");
     expect(
-      store.db
+      await store.db
         .prepare(
           "SELECT user_id,side,remaining_quantity,status FROM token_orders WHERE legacy_order_id='order-1'",
         )
@@ -58,7 +146,7 @@ describe("Smart Farm API", () => {
       status: "open",
     });
     expect(
-      store.db
+      await store.db
         .prepare(
           "SELECT available_quantity,reserved_quantity,settled_quantity FROM token_positions WHERE user_id='farmer-a' AND token_id='SFC-A01'",
         )
@@ -68,7 +156,7 @@ describe("Smart Farm API", () => {
       reserved_quantity: 2,
       settled_quantity: 6,
     });
-    store.close();
+    await store.close();
   });
   it("purchases tokens and updates wallet", async () => {
     const app = setup(),
@@ -105,41 +193,50 @@ describe("Smart Farm API", () => {
     expect(retry.status).toBe(201);
     expect(retry.body.id).toBe(first.body.id);
     expect(
-      store.db
+      await store.db
         .prepare("SELECT quantity,status FROM orders WHERE id='order-1'")
         .get(),
     ).toMatchObject({ quantity: 1, status: "판매중" });
     expect(
-      store.db.prepare("SELECT COUNT(*) AS count FROM token_executions").get()
-        .count,
+      (
+        await store.db
+          .prepare("SELECT COUNT(*) AS count FROM token_executions")
+          .get()
+      ).count,
     ).toBe(1);
     expect(
-      store.db
-        .prepare(
-          "SELECT COUNT(*) AS count FROM settlements WHERE status='confirmed'",
-        )
-        .get().count,
+      (
+        await store.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM settlements WHERE status='confirmed'",
+          )
+          .get()
+      ).count,
     ).toBe(1);
     expect(
-      store.db
-        .prepare(
-          "SELECT COUNT(*) AS count FROM credit_ledger_entries WHERE execution_id=?",
-        )
-        .get(first.body.executionId).count,
+      (
+        await store.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM credit_ledger_entries WHERE execution_id=?",
+          )
+          .get(first.body.executionId)
+      ).count,
     ).toBe(2);
     expect(
-      store.db
-        .prepare(
-          "SELECT COUNT(*) AS count FROM token_ledger_entries WHERE execution_id=?",
-        )
-        .get(first.body.executionId).count,
+      (
+        await store.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM token_ledger_entries WHERE execution_id=?",
+          )
+          .get(first.body.executionId)
+      ).count,
     ).toBe(4);
     const wallet = await request(app)
       .get("/api/wallet")
       .set("Authorization", `Bearer ${token}`);
     expect(wallet.body.totalTokens).toBe(8);
     expect(wallet.body.mockCreditBalance).toBe(1880000);
-    store.close();
+    await store.close();
   });
   it("exposes trading provider status, positions, open orders and quotes", async () => {
     const store = createStore(":memory:");
@@ -194,11 +291,13 @@ describe("Smart Farm API", () => {
       ).status,
     ).toBe(204);
     expect(
-      store.db
-        .prepare("SELECT status FROM token_orders WHERE id=?")
-        .get(created.body.id).status,
+      (
+        await store.db
+          .prepare("SELECT status FROM token_orders WHERE id=?")
+          .get(created.body.id)
+      ).status,
     ).toBe("cancelled");
-    store.close();
+    await store.close();
   });
   it("completes an order when its final quantity is purchased", async () => {
     const store = createStore(":memory:");
@@ -210,11 +309,11 @@ describe("Smart Farm API", () => {
       .send({ quantity: 2 });
     expect(purchase.status).toBe(201);
     expect(
-      store.db
+      await store.db
         .prepare("SELECT quantity,status FROM orders WHERE id='order-1'")
         .get(),
     ).toMatchObject({ quantity: 0, status: "거래완료" });
-    store.close();
+    await store.close();
   });
   it("shows and cancels the user's open sell orders", async () => {
     const app = setup(),
@@ -252,6 +351,30 @@ describe("Smart Farm API", () => {
     expect(wallet.body.openOrders).toHaveLength(0);
     expect(wallet.body.listedTokens).toBe(0);
     expect(wallet.body.totalTokens).toBe(7);
+  });
+  it("rejects unsafe high order prices without breaking account reads", async () => {
+    const app = setup(),
+      token = await login(app);
+    const rejected = await request(app)
+      .post("/api/orders")
+      .set("Authorization", `Bearer ${token}`)
+      .send({
+        tokenId: "SFC-A01",
+        quantity: 1,
+        unitPrice: "151515151515151515",
+      });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.message).toContain("개당 가격");
+
+    const dashboard = await request(app)
+      .get("/api/dashboard")
+      .set("Authorization", `Bearer ${token}`);
+    expect(dashboard.status).toBe(200);
+
+    const wallet = await request(app)
+      .get("/api/wallet")
+      .set("Authorization", `Bearer ${token}`);
+    expect(wallet.status).toBe(200);
   });
   it("validates quantity and administrator role", async () => {
     const app = setup(),
@@ -345,13 +468,11 @@ describe("Smart Farm API", () => {
     const detail = await request(app).get("/api/containers/a-01");
     expect(detail.body.rackViews[3].label).toBe("딸기 랙 D");
   });
-  it("uses a relational SQLite database with protected password hashes", async () => {
+  it("uses a relational PostgreSQL database with protected password hashes", async () => {
     const store = createStore(":memory:"),
       app = createApp({ store });
-    expect(
-      store.db.prepare("PRAGMA integrity_check").get().integrity_check,
-    ).toBe("ok");
-    const user = store.db
+    expect((await store.db.prepare("SELECT 1 AS ok").get()).ok).toBe(1);
+    const user = await store.db
       .prepare("SELECT password_hash FROM users WHERE email=?")
       .get("user@smartfarm.kr");
     expect(user.password_hash).toMatch(/^scrypt\$/);
@@ -363,7 +484,7 @@ describe("Smart Farm API", () => {
           .send({ email: "user@smartfarm.kr", password: "wrong" })
       ).status,
     ).toBe(401);
-    store.close();
+    await store.close();
   });
   it("registers a general user and starts an HttpOnly cookie session", async () => {
     const store = createStore(":memory:");
@@ -383,7 +504,8 @@ describe("Smart Farm API", () => {
     expect(signup.body).not.toHaveProperty("token");
     expect(signup.headers["set-cookie"][0]).toContain("HttpOnly");
     expect(signup.headers["set-cookie"][0]).toContain("SameSite=Lax");
-    const saved = store.db
+    expect(signup.body.sessionToken).toEqual(expect.any(String));
+    const saved = await store.db
       .prepare("SELECT password_hash FROM users WHERE email=?")
       .get("new-user@example.com");
     expect(saved.password_hash).toMatch(/^scrypt\$32768\$8\$3\$/);
@@ -406,7 +528,7 @@ describe("Smart Farm API", () => {
         })
       ).status,
     ).toBe(400);
-    store.close();
+    await store.close();
   });
   it("uses cookie sessions with a custom-header CSRF check", async () => {
     const app = setup();
@@ -488,7 +610,9 @@ describe("Smart Farm API", () => {
     const store = createStore(":memory:");
     const app = createApp({ store });
     const token = await login(app);
-    store.db.prepare("UPDATE users SET status='suspended' WHERE id='u1'").run();
+    await store.db
+      .prepare("UPDATE users SET status='suspended' WHERE id='u1'")
+      .run();
     expect(
       (
         await request(app)
@@ -504,16 +628,16 @@ describe("Smart Farm API", () => {
         })
       ).status,
     ).toBe(401);
-    store.close();
+    await store.close();
   });
-  it("writes token purchases to a signed, verifiable blockchain ledger", async () => {
+  it("writes token purchases to a signed, verifiable audit ledger", async () => {
     const store = createStore(":memory:"),
       app = createApp({ store });
     const token = await login(app);
     expect(
       (
         await request(app)
-          .get("/api/blockchain/verify")
+          .get("/api/ledger/verify")
           .set("Authorization", `Bearer ${token}`)
       ).body,
     ).toMatchObject({ valid: true, count: 1 });
@@ -526,10 +650,10 @@ describe("Smart Farm API", () => {
       ).status,
     ).toBe(201);
     const verified = await request(app)
-      .get("/api/blockchain/verify")
+      .get("/api/ledger/verify")
       .set("Authorization", `Bearer ${token}`);
     expect(verified.body).toMatchObject({ valid: true, count: 2 });
-    store.close();
+    await store.close();
   });
   it("detects payload and HMAC tampering in the private ledger", async () => {
     const store = createStore(":memory:"),
@@ -539,11 +663,14 @@ describe("Smart Farm API", () => {
       .post("/api/orders/order-1/purchase")
       .set("Authorization", `Bearer ${token}`)
       .send({ quantity: 1 });
-    store.db
+    await store.db
       .prepare("UPDATE blockchain_blocks SET payload_json='{}' WHERE height=1")
       .run();
-    expect(store.verifyBlockchain()).toMatchObject({ valid: false, height: 1 });
-    store.close();
+    expect(await store.verifyBlockchain()).toMatchObject({
+      valid: false,
+      height: 1,
+    });
+    await store.close();
   });
   it("returns DB-calculated administrator operations summary", async () => {
     const app = setup();
@@ -617,64 +744,8 @@ describe("Smart Farm API", () => {
           .send({ success: true, message: "relay on" })
       ).body.status,
     ).toBe("acknowledged");
-    expect(store.verifyBlockchain().valid).toBe(true);
-    store.close();
-  });
-  it("links an EVM wallet only after a valid challenge signature", async () => {
-    const app = setup(),
-      token = await login(app);
-    const account = privateKeyToAccount(generatePrivateKey());
-    const challenge = await request(app)
-      .post("/api/me/wallet/challenge")
-      .set("Authorization", `Bearer ${token}`);
-    const signature = await account.signMessage({
-      message: challenge.body.message,
-    });
-    const linked = await request(app)
-      .post("/api/me/wallet/verify")
-      .set("Authorization", `Bearer ${token}`)
-      .send({ address: account.address, signature });
-    expect(linked.status).toBe(200);
-    expect(linked.body.walletAddress).toBe(account.address);
-  });
-  it("builds a sensor Merkle batch and queues an outbox anchor", async () => {
-    const store = createStore(":memory:"),
-      app = createApp({ store });
-    const adminToken = await login(app, "admin@smartfarm.kr", "admin1234"),
-      admin = { Authorization: `Bearer ${adminToken}` };
-    const device = await request(app)
-      .post("/api/admin/iot/devices")
-      .set(admin)
-      .send({
-        containerId: "a-01",
-        name: "Batch Sensor",
-        deviceType: "sensor",
-      });
-    await request(app)
-      .post("/api/iot/ingest/sensors")
-      .set("X-Device-Key", device.body.apiKey)
-      .send({
-        temperature: 24,
-        humidity: 60,
-        light: 10000,
-        co2: 700,
-        soilMoisture: 50,
-        ph: 6.2,
-        ec: 1.8,
-      });
-    const batch = await request(app)
-      .post("/api/admin/public-chain/sensor-batches")
-      .set(admin)
-      .send({ containerId: "a-01", maxReadings: 100 });
-    expect(batch.status).toBe(202);
-    expect(batch.body).toMatchObject({ containerId: "a-01", readingCount: 1 });
-    expect(batch.body.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(
-      store.db
-        .prepare("SELECT status FROM public_chain_operations WHERE id=?")
-        .get(batch.body.operation.id).status,
-    ).toBe("pending");
-    store.close();
+    expect((await store.verifyBlockchain()).valid).toBe(true);
+    await store.close();
   });
   it("issues new container supply to the farm owner position", async () => {
     const store = createStore(":memory:");
@@ -701,25 +772,29 @@ describe("Smart Farm API", () => {
       tokenStatus: "issued",
     });
     expect(
-      store.db
-        .prepare(
-          "SELECT quantity FROM holdings WHERE user_id='farmer-a' AND token_id=?",
-        )
-        .get(container.body.tokenId).quantity,
+      (
+        await store.db
+          .prepare(
+            "SELECT quantity FROM holdings WHERE user_id='farmer-a' AND token_id=?",
+          )
+          .get(container.body.tokenId)
+      ).quantity,
     ).toBe(10);
     expect(
-      store.db
+      await store.db
         .prepare("SELECT 1 FROM holdings WHERE user_id='admin' AND token_id=?")
         .get(container.body.tokenId),
     ).toBeUndefined();
     expect(
-      store.db
-        .prepare(
-          "SELECT COUNT(*) AS count FROM token_ledger_entries WHERE user_id='farmer-a' AND token_id=? AND reason='ISSUE'",
-        )
-        .get(container.body.tokenId).count,
+      (
+        await store.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM token_ledger_entries WHERE user_id='farmer-a' AND token_id=? AND reason='ISSUE'",
+          )
+          .get(container.body.tokenId)
+      ).count,
     ).toBe(2);
-    store.close();
+    await store.close();
   });
   it("lets farm owners request token issuance and admins approve it", async () => {
     const store = createStore(":memory:");
@@ -768,49 +843,12 @@ describe("Smart Farm API", () => {
       tokenStatus: "issued",
     });
     expect(
-      store.db
+      await store.db
         .prepare(
           "SELECT available_quantity,settled_quantity FROM token_positions WHERE user_id='farmer-a' AND token_id=?",
         )
         .get(container.body.tokenId),
     ).toMatchObject({ available_quantity: 10, settled_quantity: 10 });
-    store.close();
-  });
-  it("queues ERC-1155 issuance when public-chain mode is enabled", async () => {
-    const store = createStore(":memory:");
-    const publicChain = {
-      enabled: true,
-      relayerEnabled: true,
-      status: () => ({
-        enabled: true,
-        relayerEnabled: true,
-        mode: "evm",
-        chainId: 31337,
-        chainName: "local",
-      }),
-    };
-    const app = createApp({ store, publicChain });
-    const token = await login(app, "admin@smartfarm.kr", "admin1234"),
-      admin = { Authorization: `Bearer ${token}` };
-    const container = await request(app)
-      .post("/api/admin/containers")
-      .set(admin)
-      .send({ farmId: "farm-a", name: "Chain Container", cropName: "케일" });
-    const recipient = privateKeyToAccount(generatePrivateKey()).address;
-    const issued = await request(app)
-      .post("/api/admin/tokens")
-      .set(admin)
-      .send({
-        containerId: container.body.id,
-        supply: 100,
-        price: 1000,
-        recipientAddress: recipient,
-      });
-    expect(issued.status).toBe(200);
-    expect(issued.body.publicChainOperation).toMatchObject({
-      operationType: "ISSUE_CONTAINER_TOKEN",
-      status: "pending",
-    });
-    store.close();
+    await store.close();
   });
 });

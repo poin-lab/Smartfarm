@@ -1,0 +1,185 @@
+---
+################################################################################
+#
+#   Organizations // 참여자 , 네트워크 멤버
+#
+################################################################################
+Organizations:
+
+    - &OrdererOrg
+        Name: OrdererOrg
+        ID: OrdererMSP
+        # [절대 경로]
+        MSPDir: organizations/ordererOrganizations/smartfarm.com/msp
+        Policies:
+            Readers: &OrdererOrgReaders
+                Type: Signature
+                Rule: "OR('OrdererMSP.member')"
+            Writers: &OrdererOrgWriters
+                Type: Signature
+                Rule: "OR('OrdererMSP.member')"
+            Admins: &OrdererOrgAdmins
+                Type: Signature
+                Rule: "OR('OrdererMSP.admin')"
+        OrdererEndpoints:
+            - orderer.smartfarm.com:7050
+
+    - &Org1
+        Name: Org1MSP
+        ID: Org1MSP
+        # [절대 경로]
+        MSPDir: organizations/peerOrganizations/org1.smartfarm.com/msp
+        Policies:
+            Readers: &Org1Readers # 스마트 컨트랙트 읽기 권한 - org1의 어드민, 피어, 클라이언트가 담당
+                Type: Signature
+                Rule: "OR('Org1MSP.admin', 'Org1MSP.peer', 'Org1MSP.client')"
+            Writers: &Org1Writers # 스마트 컨트랙트 작성 권한 - org1의 어드민과 클라이언트가 담당
+                Type: Signature
+                Rule: "OR('Org1MSP.admin', 'Org1MSP.client')"
+            Admins: &Org1Admins # 스마트 컨트랙트 관리자 권한 ,  설정 변경 - org1의 어드민이 담당
+                Type: Signature
+                Rule: "OR('Org1MSP.admin')"
+            Endorsement: &Org1Endorsement   # 스마트 컨트랙트 승인 권한 - org1의 피어가 담당
+                Type: Signature
+                Rule: "OR('Org1MSP.peer')"
+        AnchorPeers:
+            - Host: peer0.org1.smartfarm.com
+              Port: 7051
+################################################################################
+#
+#   Capabilities // 호환성 설정
+#
+################################################################################
+Capabilities:
+    Channel: &ChannelCapabilities
+        V2_0: true
+    Orderer: &OrdererCapabilities
+        V2_0: true
+    Application: &ApplicationCapabilities
+        V2_0: true
+
+################################################################################
+#
+#   Application  // 스마트 컨트랙트 설정
+#
+################################################################################
+Application: &ApplicationDefaults
+    Organizations:
+    Policies:
+        Readers:
+            Type: ImplicitMeta
+            Rule: "ANY Readers"
+        Writers:
+            Type: ImplicitMeta
+            Rule: "ANY Writers"
+        Admins:
+            Type: ImplicitMeta
+            Rule: "MAJORITY Admins"  # 과반수 이상의 어드민이 승인해야 함
+        LifecycleEndorsement:
+            Type: ImplicitMeta
+            Rule: "MAJORITY Endorsement" # 스마트 컨트랙트 라이플 사이클 승인 규칙 - 과반수 이상의 피어가 승인해야 함
+        Endorsement:
+            Type: ImplicitMeta
+            Rule: "MAJORITY Endorsement" # 스마트 컨트랙트 트랜잭션 승인 규칙 - 과반수 이상의 피어가 승인해야 함
+    Capabilities:
+        <<: *ApplicationCapabilities
+
+################################################################################
+#
+#   Orderer
+#
+################################################################################
+Orderer: &OrdererDefaults
+    OrdererType: etcdraft # 오더러 타입 설정 - etcdraft 합의 알고리즘 사용
+    Addresses:
+        - orderer.smartfarm.com:7050 # 오더러 노드 주소
+    EtcdRaft:
+        Consenters:
+        - Host: orderer.smartfarm.com # 오더러 노드 호스트네임
+          Port: 7050                     # 오더러 노드 포트
+    #       # [절대 경로] // TLS 인증서 경로 설정
+    #       ClientTLSCert: /home/inseok/workspace/smartfarm/blockchain/crypto-config/ordererOrganizations/smartfarm.com/orderers/orderer.smartfarm.com/tls/server.crt
+    #       # [절대 경로] // TLS 인증서 경로 설정
+    #       ServerTLSCert: /home/inseok/workspace/smartfarm/blockchain/crypto-config/ordererOrganizations/smartfarm.com/orderers/orderer.smartfarm.com/tls/server.crt
+          ClientTLSCert: /opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/ordererOrganizations/smartfarm.com/orderers/orderer.smartfarm.com/tls/server.crt
+          ServerTLSCert: /opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/ordererOrganizations/smartfarm.com/orderers/orderer.smartfarm.com/tls/server.crt
+
+    BatchTimeout: 2s
+    BatchSize:
+        MaxMessageCount: 10 # 한 배치에 포함될 최대 메시지 수
+        AbsoluteMaxBytes: 99 MB # 한 배치의 최대 크기
+        PreferredMaxBytes: 512 KB # 권장 최대 배치 크기
+    Organizations:
+    Policies:
+        Readers:
+            Type: ImplicitMeta
+            Rule: "ANY Readers"
+        Writers:
+            Type: ImplicitMeta
+            Rule: "ANY Writers"
+        Admins:
+            Type: ImplicitMeta
+            Rule: "MAJORITY Admins"
+        BlockValidation: # 블록 검증 정책 설정 - 모든 작성자가 블록을 검증해야 함
+            Type: ImplicitMeta
+            Rule: "ANY Writers"
+
+################################################################################
+#
+#   Channel  채널 설정   트랜잭션이 발생하는 논리적 구분 단위
+#
+################################################################################
+Channel: &ChannelDefaults # 채널 기본 설정
+    Policies:
+        Readers:
+            Type: ImplicitMeta
+            Rule: "ANY Readers"
+        Writers:
+            Type: ImplicitMeta
+            Rule: "ANY Writers"
+        Admins:
+            Type: ImplicitMeta
+            Rule: "MAJORITY Admins"
+    Capabilities:
+        <<: *ChannelCapabilities # 채널 호환성 설정
+
+################################################################################
+#
+#   Profiles 프로파일 설정   네트워크 구성 템플릿
+#
+################################################################################
+Profiles:
+
+    TwoOrgsOrdererGenesis:  # 오더러 제네시스 블록 프로파일
+        <<: *ChannelDefaults # 채널 기본 설정 상속
+        Orderer:
+            <<: *OrdererDefaults # 오더러 기본 설정 상속
+            Organizations:
+                - *OrdererOrg # 오더러 조직 포함
+            Capabilities:
+                <<: *OrdererCapabilities
+        Application:
+            <<: *ApplicationDefaults
+            Organizations:
+                - *Org1
+            Capabilities:
+                <<: *ApplicationCapabilities
+
+
+    TwoOrgsChannel:
+        Consortium: SampleConsortium # 컨소시엄 참조
+        <<: *ChannelDefaults
+
+        Orderer:
+            <<: *OrdererDefaults
+            Organizations:
+                - *OrdererOrg
+            Capabilities:
+                <<: *OrdererCapabilities
+
+        Application:
+            <<: *ApplicationDefaults
+            Organizations:
+                - *Org1
+            Capabilities:
+                <<: *ApplicationCapabilities

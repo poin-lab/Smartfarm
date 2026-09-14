@@ -8,25 +8,19 @@ import {
   hashPasswordStrong,
   verifyPasswordAsync,
 } from "./database.js";
-import { createLoginAuthenticator } from "./login-authenticator.js";
+import { createLoginAuthenticator } from "./account/authenticator.js";
 import { requestLogger } from "./logger.js";
 import { config } from "./config.js";
-import { getAddress, isAddress, verifyMessage } from "viem";
-import {
-  containerTokenId,
-  createPublicChain,
-  merkleRoot,
-  processNextChainOperation,
-} from "./public-chain.js";
 import {
   BrokerTradingProvider,
   createInternalTradingProvider,
-} from "./trading-provider.js";
+} from "./trading/index.js";
+import { TRADING_LIMITS, positiveInt } from "./trading/limits.js";
+import { anchorPendingExecutions } from "./blockchain/anchor.js";
+import { demoAccounts } from "./seed.js";
 
 const text = (value, max = 120) =>
   typeof value === "string" ? value.trim().slice(0, max) : "";
-const positiveInt = (value) =>
-  Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : null;
 const tokenHash = (token) => createHash("sha256").update(token).digest("hex");
 const now = () => new Date().toISOString();
 const production = config.env === "production";
@@ -83,7 +77,6 @@ const publicUser = (record) => {
     role: record.role,
     phone: record.phone,
     status: record.status,
-    walletAddress: record.wallet_address || null,
     mockCreditBalance: record.credit_balance,
     createdAt: record.created_at,
     updatedAt: record.updated_at,
@@ -108,7 +101,6 @@ const containerView = (row) =>
     totalTokenSupply: row.total_token_supply,
     availableTokenQuantity: row.available_token_quantity,
     tokenPrice: row.token_price,
-    publicChainTokenId: containerTokenId(row.id).toString(),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -122,7 +114,6 @@ const farmView = (row) =>
 
 export function createApp({
   store = createDatabase(),
-  publicChain = createPublicChain(),
   loginAuthenticator,
 } = {}) {
   const app = express();
@@ -143,6 +134,28 @@ export function createApp({
       referrerPolicy: { policy: "no-referrer" },
     }),
   );
+  if (config.env !== "production") {
+    // Lets the local admin.html dev console call this API from a different
+    // origin (serve-admin.js on :4101, or a file:// page). Bearer-token auth
+    // only, so no credentialed cookies are involved — safe to reflect the
+    // origin here without Allow-Credentials. Never enabled in production.
+    app.use((req, res, next) => {
+      res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, X-Green-Link-Request, Idempotency-Key",
+      );
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS");
+      // Chrome's Private Network Access policy preflights (and otherwise
+      // blocks) requests reaching localhost from a page it considers a
+      // "public" address space — which includes plain file:// pages. This
+      // opts back in for local dev.
+      if (req.headers["access-control-request-private-network"])
+        res.setHeader("Access-Control-Allow-Private-Network", "true");
+      if (req.method === "OPTIONS") return res.sendStatus(204);
+      next();
+    });
+  }
   app.use(express.json({ limit: "100kb", strict: true }));
   app.use(
     "/api",
@@ -170,16 +183,16 @@ export function createApp({
   const getUser = (id) =>
     db
       .prepare(
-        "SELECT id,name,email,role,phone,wallet_address,credit_balance,status,last_login_at,password_changed_at,created_at,updated_at,password_hash FROM users WHERE id=?",
+        "SELECT id,name,email,role,phone,credit_balance,status,last_login_at,password_changed_at,created_at,updated_at,password_hash FROM users WHERE id=?",
       )
       .get(id);
-  const createSession = (userId) => {
+  const createSession = async (userId) => {
     const token = randomBytes(32).toString("base64url");
     const expiresAt = new Date(
       Date.now() + config.sessionHours * 60 * 60 * 1000,
     ).toISOString();
-    db.prepare("DELETE FROM sessions WHERE expires_at<=?").run(now());
-    db.prepare("INSERT INTO sessions VALUES (?,?,?,?)").run(
+    await db.prepare("DELETE FROM sessions WHERE expires_at<=?").run(now());
+    await db.prepare("INSERT INTO sessions VALUES (?,?,?,?)").run(
       tokenHash(token),
       userId,
       expiresAt,
@@ -187,24 +200,25 @@ export function createApp({
     );
     return { token, expiresAt };
   };
-  const auth = (req, res, next) => {
+  const auth = async (req, res, next) => {
     const cookieToken = readCookie(req.headers.cookie, sessionCookie);
     const bearerToken =
       req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-    const token = cookieToken || bearerToken;
+    const token = bearerToken || cookieToken;
     if (!token)
       return res.status(401).json({ message: "로그인이 필요합니다." });
-    const session = db
+    const session = await db
       .prepare(
         "SELECT user_id FROM sessions WHERE token_hash=? AND expires_at>? ",
       )
       .get(tokenHash(token), now());
     if (!session)
       return res.status(401).json({ message: "로그인이 만료되었습니다." });
-    const user = getUser(session.user_id);
+    const user = await getUser(session.user_id);
     if (!user || user.status !== "active")
       return res.status(401).json({ message: "로그인이 필요합니다." });
     if (
+      !bearerToken &&
       cookieToken &&
       !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
       req.headers["x-green-link-request"] !== "1"
@@ -212,7 +226,7 @@ export function createApp({
       return res.status(403).json({ message: "요청을 확인할 수 없습니다." });
     req.user = user;
     req.sessionTokenHash = tokenHash(token);
-    next();
+    return next();
   };
   const admin = (req, res, next) =>
     req.user?.role === "admin"
@@ -221,8 +235,8 @@ export function createApp({
   const getContainer = (id) =>
     db.prepare("SELECT * FROM containers WHERE id=?").get(id);
   const getFarm = (id) => db.prepare("SELECT * FROM farms WHERE id=?").get(id);
-  const getRackViews = (containerId) => {
-    const content = db
+  const getRackViews = async (containerId) => {
+    const content = await db
       .prepare(
         "SELECT rack_views_json FROM container_page_content WHERE container_id=?",
       )
@@ -237,18 +251,18 @@ export function createApp({
       return defaultRackViews;
     }
   };
-  const containerMarketView = (container) => {
+  const containerMarketView = async (container) => {
     const view = containerView(container);
     if (!view) return null;
-    const orderStats = db
+    const orderStats = await db
       .prepare(
         "SELECT COALESCE(SUM(quantity),0) AS open_sell_quantity,MIN(unit_price) AS lowest_ask_price FROM orders WHERE container_id=? AND status='판매중' AND quantity>0",
       )
       .get(view.id);
-    const token = db
+    const token = await db
       .prepare("SELECT * FROM container_tokens WHERE container_id=?")
       .get(view.id);
-    const lastExecution = db
+    const lastExecution = await db
       .prepare(
         "SELECT unit_price FROM token_executions WHERE token_id=? ORDER BY executed_at DESC LIMIT 1",
       )
@@ -271,17 +285,18 @@ export function createApp({
       executionVenue: token?.execution_venue || "INTERNAL",
     };
   };
-  const withFarm = (container) => {
-    const view = containerMarketView(container);
+  const withFarm = async (container) => {
+    const view = await containerMarketView(container);
     if (!view) return null;
     return {
       ...view,
-      farm: farmView(getFarm(view.farmId)),
-      rackViews: getRackViews(view.id),
+      farm: farmView(await getFarm(view.farmId)),
+      rackViews: await getRackViews(view.id),
     };
   };
-  const orderView = (row) =>
-    row && {
+  const orderView = async (row) => {
+    if (!row) return row;
+    return {
       ...row,
       sellerId: row.seller_id,
       tokenId: row.token_id,
@@ -293,9 +308,10 @@ export function createApp({
       unitPrice: row.unit_price,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      container: containerMarketView(getContainer(row.container_id)),
+      container: await containerMarketView(await getContainer(row.container_id)),
     };
-  const holdingView = (row, reservedQuantity = 0) => {
+  };
+  const holdingView = async (row, reservedQuantity = 0) => {
     const quantity = Number(row.quantity);
     return {
       ...row,
@@ -307,17 +323,18 @@ export function createApp({
       reservedQuantity,
       settledQuantity: quantity + reservedQuantity,
       averagePrice: row.average_price,
-      container: containerMarketView(getContainer(row.container_id)),
+      container: await containerMarketView(await getContainer(row.container_id)),
     };
   };
-  const reservedByToken = (userId) =>
+  const reservedByToken = async (userId) =>
     new Map(
-      db
-        .prepare(
-          "SELECT token_id,COALESCE(SUM(quantity),0) AS quantity FROM orders WHERE seller_id=? AND status='판매중' GROUP BY token_id",
-        )
-        .all(userId)
-        .map((row) => [row.token_id, Number(row.quantity)]),
+      (
+        await db
+          .prepare(
+            "SELECT token_id,COALESCE(SUM(quantity),0) AS quantity FROM orders WHERE seller_id=? AND status='판매중' GROUP BY token_id",
+          )
+          .all(userId)
+      ).map((row) => [row.token_id, Number(row.quantity)]),
     );
   const idempotencyKey = (req) =>
     text(req.get("Idempotency-Key") || req.body?.idempotencyKey, 160);
@@ -337,11 +354,11 @@ export function createApp({
       payload,
       timestamp: now(),
     });
-  const deviceAuth = (types) => (req, res, next) => {
+  const deviceAuth = (types) => async (req, res, next) => {
     const key = text(req.headers["x-device-key"], 200);
     if (!key)
       return res.status(401).json({ message: "장비 인증키가 필요합니다." });
-    const device = db
+    const device = await db
       .prepare(
         "SELECT * FROM iot_devices WHERE api_key_hash=? AND status!='disabled'",
       )
@@ -350,11 +367,13 @@ export function createApp({
       return res
         .status(401)
         .json({ message: "유효하지 않은 장비 인증키입니다." });
-    db.prepare(
-      "UPDATE iot_devices SET status='online',last_seen_at=?,updated_at=? WHERE id=?",
-    ).run(now(), now(), device.id);
+    await db
+      .prepare(
+        "UPDATE iot_devices SET status='online',last_seen_at=?,updated_at=? WHERE id=?",
+      )
+      .run(now(), now(), device.id);
     req.device = device;
-    next();
+    return next();
   };
   const sensorPayload = (body) => {
     const ranges = {
@@ -374,7 +393,7 @@ export function createApp({
     }
     return payload;
   };
-  const liveTicketAuth = (req, res, next) => {
+  const liveTicketAuth = async (req, res, next) => {
     const ticket = text(req.query.ticket, 160);
     const record = ticket && streamTickets.get(ticket);
     if (
@@ -383,21 +402,21 @@ export function createApp({
       record.containerId === req.params.id
     ) {
       streamTickets.delete(ticket);
-      req.user = getUser(record.userId);
+      req.user = await getUser(record.userId);
       return next();
     }
     if (ticket) streamTickets.delete(ticket);
     return auth(req, res, next);
   };
 
-  app.get("/api/health", (_req, res) => {
-    const check = db.prepare("PRAGMA integrity_check").get();
-    const blockchain = store.verifyBlockchain();
-    const ok = check.integrity_check === "ok" && blockchain.valid;
+  app.get("/api/health", async (_req, res) => {
+    const check = await db.prepare("SELECT 1 AS ok").get();
+    const blockchain = await store.verifyBlockchain();
+    const ok = check?.ok === 1 && blockchain.valid;
     res.status(ok ? 200 : 503).json({
       ok,
       service: "smartfarm-api",
-      database: "sqlite",
+      database: "postgresql",
       blockchain,
       timestamp: now(),
     });
@@ -418,7 +437,7 @@ export function createApp({
         .json({ message: "올바른 이메일을 입력해 주세요." });
     const problem = passwordProblem(password);
     if (problem) return res.status(400).json({ message: problem });
-    if (db.prepare("SELECT 1 FROM users WHERE email=?").get(email))
+    if (await db.prepare("SELECT 1 FROM users WHERE email=?").get(email))
       return res.status(409).json({ message: "이미 가입된 이메일입니다." });
 
     const id = `user-${randomUUID()}`;
@@ -426,31 +445,34 @@ export function createApp({
     const passwordHash = await hashPasswordStrong(password);
     let session;
     try {
-      store.transaction(() => {
-        db.prepare(
-          "INSERT INTO users (id,name,email,password_hash,role,phone,status,password_changed_at,created_at,updated_at) VALUES (?,?,?,?,'user',?,'active',?,?,?)",
-        ).run(
-          id,
-          name,
-          email,
-          passwordHash,
-          phone,
-          createdAt,
-          createdAt,
-          createdAt,
-        );
-        session = createSession(id);
-        store.audit(id, "REGISTER", "user", id, {});
+      await store.transaction(async () => {
+        await db
+          .prepare(
+            "INSERT INTO users (id,name,email,password_hash,role,phone,status,password_changed_at,created_at,updated_at) VALUES (?,?,?,?,'user',?,'active',?,?,?)",
+          )
+          .run(
+            id,
+            name,
+            email,
+            passwordHash,
+            phone,
+            createdAt,
+            createdAt,
+            createdAt,
+          );
+        session = await createSession(id);
+        await store.audit(id, "REGISTER", "user", id, {});
       });
     } catch (error) {
-      if (String(error.message).includes("UNIQUE"))
+      if (error.code === "23505")
         return res.status(409).json({ message: "이미 가입된 이메일입니다." });
       throw error;
     }
     res.cookie(sessionCookie, session.token, cookieOptions);
     return res.status(201).json({
-      user: publicUser(getUser(id)),
+      user: publicUser(await getUser(id)),
       expiresAt: session.expiresAt,
+      sessionToken: session.token,
     });
   });
   app.post("/api/auth/login", loginLimiter, async (req, res) => {
@@ -468,96 +490,46 @@ export function createApp({
         .status(503)
         .json({ message: "로그인 계정 설정을 확인해 주세요." });
     }
-    let user = account && getUser(account.id);
+    let user = account && (await getUser(account.id));
     if (!user || user.role !== account.role || user.status !== "active")
       return res
         .status(401)
         .json({ message: "이메일 또는 비밀번호를 확인해 주세요." });
     let session;
-    store.transaction(() => {
-      session = createSession(user.id);
-      db.prepare(
-        "UPDATE users SET last_login_at=?,updated_at=? WHERE id=?",
-      ).run(now(), now(), user.id);
-      store.audit(user.id, "LOGIN", "user", user.id, {});
+    await store.transaction(async () => {
+      session = await createSession(user.id);
+      await db
+        .prepare("UPDATE users SET last_login_at=?,updated_at=? WHERE id=?")
+        .run(now(), now(), user.id);
+      await store.audit(user.id, "LOGIN", "user", user.id, {});
     });
-    user = getUser(user.id);
+    user = await getUser(user.id);
     res.cookie(sessionCookie, session.token, cookieOptions);
-    res.json({ user: publicUser(user), expiresAt: session.expiresAt });
+    res.json({
+      user: publicUser(user),
+      expiresAt: session.expiresAt,
+      sessionToken: session.token,
+    });
   });
-  app.post("/api/auth/logout", auth, (req, res) => {
-    db.prepare("DELETE FROM sessions WHERE token_hash=?").run(
-      req.sessionTokenHash,
-    );
-    audit(req, "LOGOUT", "user", req.user.id, {});
+  app.post("/api/auth/logout", auth, async (req, res) => {
+    await db
+      .prepare("DELETE FROM sessions WHERE token_hash=?")
+      .run(req.sessionTokenHash);
+    await audit(req, "LOGOUT", "user", req.user.id, {});
     res.clearCookie(sessionCookie, cookieClearOptions);
     res.status(204).end();
   });
   app.get("/api/me", auth, (req, res) => res.json(publicUser(req.user)));
-  app.get("/api/public-chain/status", (_req, res) =>
-    res.json(publicChain.status()),
-  );
-  app.post("/api/me/wallet/challenge", auth, (req, res) => {
-    const nonce = randomBytes(24).toString("base64url"),
-      createdAt = now();
-    const message = `GREEN LINK wallet link\nUser: ${req.user.id}\nNonce: ${nonce}`;
-    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
-    db.prepare(
-      "INSERT INTO wallet_challenges VALUES (?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET nonce=excluded.nonce,message=excluded.message,expires_at=excluded.expires_at,created_at=excluded.created_at",
-    ).run(req.user.id, nonce, message, expiresAt, createdAt);
-    res.json({ message, expiresAt });
-  });
-  app.post("/api/me/wallet/verify", auth, async (req, res) => {
-    const address = text(req.body?.address, 50),
-      signature = text(req.body?.signature, 160);
-    const challenge = db
-      .prepare(
-        "SELECT * FROM wallet_challenges WHERE user_id=? AND expires_at>?",
-      )
-      .get(req.user.id, now());
-    if (
-      !challenge ||
-      !isAddress(address) ||
-      !/^0x[0-9a-fA-F]{130}$/.test(signature)
-    )
-      return res
-        .status(400)
-        .json({ message: "유효한 지갑 서명 요청이 아닙니다." });
-    const valid = await verifyMessage({
-      address: getAddress(address),
-      message: challenge.message,
-      signature,
-    });
-    if (!valid)
-      return res
-        .status(401)
-        .json({ message: "지갑 서명이 일치하지 않습니다." });
-    store.transaction(() => {
-      db.prepare(
-        "UPDATE users SET wallet_address=?,updated_at=? WHERE id=?",
-      ).run(getAddress(address), now(), req.user.id);
-      db.prepare("DELETE FROM wallet_challenges WHERE user_id=?").run(
-        req.user.id,
-      );
-      audit(req, "LINK_PUBLIC_WALLET", "user", req.user.id, {
-        address: getAddress(address),
-      });
-    });
-    res.json(publicUser(getUser(req.user.id)));
-  });
-  app.patch("/api/me", auth, (req, res) => {
+  app.patch("/api/me", auth, async (req, res) => {
     const name = text(req.body?.name, 30),
       phone = text(req.body?.phone, 20);
     if (!name)
       return res.status(400).json({ message: "이름을 입력해 주세요." });
-    db.prepare("UPDATE users SET name=?,phone=?,updated_at=? WHERE id=?").run(
-      name,
-      phone,
-      now(),
-      req.user.id,
-    );
-    audit(req, "UPDATE_PROFILE", "user", req.user.id, {});
-    res.json(publicUser(getUser(req.user.id)));
+    await db
+      .prepare("UPDATE users SET name=?,phone=?,updated_at=? WHERE id=?")
+      .run(name, phone, now(), req.user.id);
+    await audit(req, "UPDATE_PROFILE", "user", req.user.id, {});
+    res.json(publicUser(await getUser(req.user.id)));
   });
   app.patch("/api/me/password", auth, async (req, res) => {
     const currentPassword =
@@ -581,25 +553,26 @@ export function createApp({
 
     const passwordHash = await hashPasswordStrong(newPassword);
     const changedAt = now();
-    store.transaction(() => {
-      db.prepare(
-        "UPDATE users SET password_hash=?,password_changed_at=?,updated_at=? WHERE id=?",
-      ).run(passwordHash, changedAt, changedAt, req.user.id);
-      db.prepare("DELETE FROM sessions WHERE user_id=? AND token_hash<>?").run(
-        req.user.id,
-        req.sessionTokenHash,
-      );
-      audit(req, "CHANGE_PASSWORD", "user", req.user.id, {});
+    await store.transaction(async () => {
+      await db
+        .prepare(
+          "UPDATE users SET password_hash=?,password_changed_at=?,updated_at=? WHERE id=?",
+        )
+        .run(passwordHash, changedAt, changedAt, req.user.id);
+      await db
+        .prepare("DELETE FROM sessions WHERE user_id=? AND token_hash<>?")
+        .run(req.user.id, req.sessionTokenHash);
+      await audit(req, "CHANGE_PASSWORD", "user", req.user.id, {});
     });
     res.status(204).end();
   });
 
-  app.get("/api/farms", (req, res) => {
+  app.get("/api/farms", async (req, res) => {
     const query = text(req.query.q, 80).toLowerCase(),
       status = text(req.query.status, 20);
-    const rows = db
+    const rows = await db
       .prepare(
-        `SELECT f.*,COUNT(c.id) AS containerCount FROM farms f LEFT JOIN containers c ON c.farm_id=f.id WHERE (?='' OR lower(f.name||' '||f.address) LIKE '%'||?||'%') AND (?='' OR ?='전체' OR f.status=?) GROUP BY f.id ORDER BY f.created_at`,
+        `SELECT f.*,COUNT(c.id) AS "containerCount" FROM farms f LEFT JOIN containers c ON c.farm_id=f.id WHERE (?='' OR lower(f.name||' '||f.address) LIKE '%'||?||'%') AND (?='' OR ?='전체' OR f.status=?) GROUP BY f.id ORDER BY f.created_at`,
       )
       .all(query, query, status, status, status);
     res.json(
@@ -609,41 +582,79 @@ export function createApp({
       })),
     );
   });
-  app.get("/api/farms/:id", (req, res) => {
-    const farm = getFarm(req.params.id);
+  app.get("/api/farms/:id", async (req, res) => {
+    const farm = await getFarm(req.params.id);
     if (!farm)
       return res.status(404).json({ message: "농장을 찾을 수 없습니다." });
+    const containers = await db
+      .prepare("SELECT * FROM containers WHERE farm_id=? ORDER BY id")
+      .all(farm.id);
     res.json({
       ...farmView(farm),
-      containers: db
-        .prepare("SELECT * FROM containers WHERE farm_id=? ORDER BY id")
-        .all(farm.id)
-        .map(containerMarketView),
+      containers: await Promise.all(containers.map(containerMarketView)),
     });
   });
-  app.get("/api/containers", (req, res) => {
+  app.get("/api/containers", async (req, res) => {
     const query = text(req.query.q, 80).toLowerCase(),
-      farmId = text(req.query.farmId, 50);
-    const rows = db
-      .prepare(
-        "SELECT * FROM containers WHERE (?='' OR farm_id=?) AND (?='' OR lower(name||' '||crop_name||' '||token_id) LIKE '%'||?||'%') ORDER BY id",
-      )
-      .all(farmId, farmId, query, query);
-    res.json(rows.map(withFarm));
+      farmId = text(req.query.farmId, 50),
+      owner = text(req.query.owner, 20);
+    const sendContainers = async (ownerId = "") => {
+      // "내 농장" (owner=me) shows farms I operate AND any container whose
+      // token I've bought into — visibility only. Management stays tied to
+      // farm.owner_id (see DATABASE_BLOCKCHAIN_DESIGN.md: operator/issuer/
+      // holder are deliberately separate roles), so being listed here as a
+      // holder does not grant control over the container.
+      const rows = await db
+        .prepare(
+          `SELECT c.*
+             FROM containers c
+             JOIN farms f ON f.id=c.farm_id
+            WHERE (?='' OR c.farm_id=?)
+              AND (
+                ?=''
+                OR f.owner_id=?
+                OR EXISTS (
+                     SELECT 1 FROM holdings h
+                      WHERE h.user_id=? AND h.token_id=c.token_id AND h.quantity>0
+                   )
+              )
+              AND (?='' OR lower(c.name||' '||c.crop_name||' '||c.token_id) LIKE '%'||?||'%')
+            ORDER BY c.id`,
+        )
+        .all(farmId, farmId, ownerId, ownerId, ownerId, query, query);
+      const views = await Promise.all(rows.map(withFarm));
+      if (!ownerId) return res.json(views);
+      const withStake = await Promise.all(
+        views.map(async (view) => {
+          const holding = await db
+            .prepare("SELECT quantity FROM holdings WHERE user_id=? AND token_id=?")
+            .get(ownerId, view.tokenId);
+          return {
+            ...view,
+            viewerIsOwner: view.farm?.ownerId === ownerId,
+            viewerHoldingQuantity: holding?.quantity || 0,
+          };
+        }),
+      );
+      res.json(withStake);
+    };
+    if (owner === "me")
+      return auth(req, res, () => sendContainers(req.user.id));
+    return sendContainers();
   });
-  app.get("/api/containers/:id", (req, res) => {
-    const row = withFarm(getContainer(req.params.id));
+  app.get("/api/containers/:id", async (req, res) => {
+    const row = await withFarm(await getContainer(req.params.id));
     if (!row)
       return res.status(404).json({ message: "컨테이너를 찾을 수 없습니다." });
     res.json(row);
   });
-  app.post("/api/containers/:id/token-requests", auth, (req, res) => {
+  app.post("/api/containers/:id/token-requests", auth, async (req, res) => {
     try {
-      const requested = trading.requestIssuance({
+      const requested = await trading.requestIssuance({
         userId: req.user.id,
         containerId: req.params.id,
-        supply: positiveInt(req.body?.supply),
-        price: positiveInt(req.body?.price),
+        supply: positiveInt(req.body?.supply, TRADING_LIMITS.maxQuantity),
+        price: positiveInt(req.body?.price, TRADING_LIMITS.maxUnitPrice),
         terms: req.body?.terms || {},
       });
       res.status(201).json(requested);
@@ -651,9 +662,9 @@ export function createApp({
       tradingError(res, error, "토큰 발행 신청 중 오류가 발생했습니다.");
     }
   });
-  app.get("/api/containers/:id/sensors", (req, res) => {
+  app.get("/api/containers/:id/sensors", async (req, res) => {
     const row = sensorView(
-      db
+      await db
         .prepare("SELECT * FROM sensor_readings WHERE container_id=?")
         .get(req.params.id),
     );
@@ -664,19 +675,16 @@ export function createApp({
     res.json(row);
   });
 
-  app.get("/api/orders", (req, res) => {
-    res.json(
-      trading
-        .listPublicSellOrders({ query: req.query.q })
-        .map((row) => orderView(row)),
-    );
+  app.get("/api/orders", async (req, res) => {
+    const rows = await trading.listPublicSellOrders({ query: req.query.q });
+    res.json(await Promise.all(rows.map((row) => orderView(row))));
   });
-  app.post("/api/orders/:id/purchase", auth, (req, res) => {
+  app.post("/api/orders/:id/purchase", auth, async (req, res) => {
     try {
-      const result = trading.purchaseSellOrder({
+      const result = await trading.purchaseSellOrder({
         buyerId: req.user.id,
         orderId: req.params.id,
-        quantity: positiveInt(req.body?.quantity),
+        quantity: positiveInt(req.body?.quantity, TRADING_LIMITS.maxQuantity),
         key: idempotencyKey(req),
       });
       return sendTradingResult(res, result);
@@ -684,27 +692,30 @@ export function createApp({
       return tradingError(res, error, "주문 처리 중 오류가 발생했습니다.");
     }
   });
-  app.post("/api/orders", auth, (req, res) => {
+  app.post("/api/orders", auth, async (req, res) => {
     try {
-      const result = trading.placeSellOrder({
+      const result = await trading.placeSellOrder({
         userId: req.user.id,
         tokenId: text(req.body?.tokenId, 30),
-        quantity: positiveInt(req.body?.quantity),
-        unitPrice: positiveInt(req.body?.unitPrice),
+        quantity: positiveInt(req.body?.quantity, TRADING_LIMITS.maxQuantity),
+        unitPrice: positiveInt(
+          req.body?.unitPrice,
+          TRADING_LIMITS.maxUnitPrice,
+        ),
         key: idempotencyKey(req),
       });
-      const body =
-        orderView(
-          db.prepare("SELECT * FROM orders WHERE id=?").get(result.body.id),
-        ) || result.body;
+      const savedOrder = await db
+        .prepare("SELECT * FROM orders WHERE id=?")
+        .get(result.body.id);
+      const body = (savedOrder && (await orderView(savedOrder))) || result.body;
       return res.status(result.status).json(body);
     } catch (error) {
       return tradingError(res, error, "판매 주문 처리 중 오류가 발생했습니다.");
     }
   });
-  app.post("/api/orders/:id/cancel", auth, (req, res) => {
+  app.post("/api/orders/:id/cancel", auth, async (req, res) => {
     try {
-      const result = trading.cancelSellOrder({
+      const result = await trading.cancelSellOrder({
         userId: req.user.id,
         orderId: req.params.id,
       });
@@ -729,28 +740,28 @@ export function createApp({
       ],
     });
   });
-  app.get("/api/trading/instruments", auth, (req, res) => {
-    res.json(trading.listInstruments());
+  app.get("/api/trading/instruments", auth, async (req, res) => {
+    res.json(await trading.listInstruments());
   });
-  app.get("/api/trading/instruments/:tokenId/quote", auth, (req, res) => {
-    res.json(trading.getQuote(req.params.tokenId));
+  app.get("/api/trading/instruments/:tokenId/quote", auth, async (req, res) => {
+    res.json(await trading.getQuote(req.params.tokenId));
   });
-  app.get("/api/trading/positions", auth, (req, res) => {
-    res.json(trading.listPositions(req.user.id));
+  app.get("/api/trading/positions", auth, async (req, res) => {
+    res.json(await trading.listPositions(req.user.id));
   });
-  app.get("/api/trading/orders", auth, (req, res) => {
+  app.get("/api/trading/orders", auth, async (req, res) => {
     const userId =
       req.user.role === "admin" && req.query.all === "1" ? "" : req.user.id;
     res.json(
-      trading.listOrders({
+      await trading.listOrders({
         userId,
         tokenId: text(req.query.tokenId, 40),
       }),
     );
   });
-  app.post("/api/trading/orders", auth, (req, res) => {
+  app.post("/api/trading/orders", auth, async (req, res) => {
     try {
-      const result = trading.placeOrder({
+      const result = await trading.placeOrder({
         userId: req.user.id,
         body: { ...req.body, idempotencyKey: idempotencyKey(req) },
       });
@@ -759,17 +770,17 @@ export function createApp({
       return tradingError(res, error, "거래 주문 처리 중 오류가 발생했습니다.");
     }
   });
-  app.get("/api/trading/orders/:id", auth, (req, res) => {
-    const order = trading.getOrder(req.params.id);
+  app.get("/api/trading/orders/:id", auth, async (req, res) => {
+    const order = await trading.getOrder(req.params.id);
     if (!order)
       return res.status(404).json({ message: "주문을 찾을 수 없습니다." });
     if (req.user.role !== "admin" && order.userId !== req.user.id)
       return res.status(403).json({ message: "접근 권한이 없습니다." });
     res.json(order);
   });
-  app.post("/api/trading/orders/:id/cancel", auth, (req, res) => {
+  app.post("/api/trading/orders/:id/cancel", auth, async (req, res) => {
     try {
-      const result = trading.cancelOrder({
+      const result = await trading.cancelOrder({
         userId: req.user.id,
         orderId: req.params.id,
       });
@@ -778,59 +789,61 @@ export function createApp({
       return tradingError(res, error, "주문 취소 중 오류가 발생했습니다.");
     }
   });
-  app.get("/api/trading/executions", auth, (req, res) => {
+  app.get("/api/trading/executions", auth, async (req, res) => {
     const userId =
       req.user.role === "admin" && req.query.all === "1" ? "" : req.user.id;
     res.json(
-      trading.listExecutions({
+      await trading.listExecutions({
         userId,
         tokenId: text(req.query.tokenId, 40),
       }),
     );
   });
-  app.get("/api/wallet", auth, (req, res) => {
-    const openOrders = db
+  app.get("/api/wallet", auth, async (req, res) => {
+    const openOrderRows = await db
       .prepare(
         "SELECT * FROM orders WHERE seller_id=? AND status='판매중' ORDER BY created_at DESC",
       )
-      .all(req.user.id)
-      .map(orderView);
-    const positions = trading.listPositions(req.user.id);
+      .all(req.user.id);
+    const openOrders = await Promise.all(openOrderRows.map(orderView));
+    const positions = await trading.listPositions(req.user.id);
     const positionByToken = new Map(
       positions.map((position) => [position.tokenId, position]),
     );
-    const reserved = reservedByToken(req.user.id);
-    const holdings = db
+    const reserved = await reservedByToken(req.user.id);
+    const holdingRows = await db
       .prepare(
         "SELECT * FROM holdings WHERE user_id=? AND quantity>0 ORDER BY token_id",
       )
-      .all(req.user.id)
-      .map((row) => {
+      .all(req.user.id);
+    const holdings = await Promise.all(
+      holdingRows.map(async (row) => {
         const position = positionByToken.get(row.token_id);
         return {
-          ...holdingView(
+          ...(await holdingView(
             row,
             position?.reservedQuantity ?? reserved.get(row.token_id) ?? 0,
-          ),
+          )),
           availableQuantity: position?.availableQuantity ?? row.quantity,
           reservedQuantity:
             position?.reservedQuantity ?? reserved.get(row.token_id) ?? 0,
           unsettledQuantity: position?.unsettledQuantity ?? 0,
           settledQuantity: position?.settledQuantity ?? row.quantity,
         };
-      });
-    const transactions = db
+      }),
+    );
+    const transactionRows = await db
       .prepare(
         "SELECT * FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
       )
-      .all(req.user.id)
-      .map((row) => ({
-        ...row,
-        userId: row.user_id,
-        tokenId: row.token_id,
-        unitPrice: row.unit_price,
-        createdAt: row.created_at,
-      }));
+      .all(req.user.id);
+    const transactions = transactionRows.map((row) => ({
+      ...row,
+      userId: row.user_id,
+      tokenId: row.token_id,
+      unitPrice: row.unit_price,
+      createdAt: row.created_at,
+    }));
     const availableTokens = holdings.reduce((sum, h) => sum + h.quantity, 0);
     const listedTokens = openOrders.reduce(
       (sum, order) => sum + order.quantity,
@@ -857,54 +870,54 @@ export function createApp({
           (sum, order) => sum + order.quantity * order.unitPrice,
           0,
         ),
-      mockCreditBalance: getUser(req.user.id).credit_balance,
+      mockCreditBalance: (await getUser(req.user.id)).credit_balance,
       paymentProvider: "mock",
       transactions,
     });
   });
-  app.get("/api/dashboard", auth, (req, res) => {
-    const farms = db
+  app.get("/api/dashboard", auth, async (req, res) => {
+    const farmRows = await db
       .prepare("SELECT * FROM farms WHERE owner_id=? ORDER BY created_at")
-      .all(req.user.id)
-      .map(farmView);
+      .all(req.user.id);
+    const farms = farmRows.map(farmView);
     const ids = farms.map((farm) => farm.id);
-    const containers = ids.length
-      ? db
+    const containerRows = ids.length
+      ? await db
           .prepare(
             `SELECT * FROM containers WHERE farm_id IN (${ids.map(() => "?").join(",")})`,
           )
           .all(...ids)
-          .map(withFarm)
       : [];
-    const alerts = containers.flatMap((container) => {
+    const containers = await Promise.all(containerRows.map(withFarm));
+    const alerts = [];
+    for (const container of containers) {
       const sensor = sensorView(
-        db
+        await db
           .prepare("SELECT * FROM sensor_readings WHERE container_id=?")
           .get(container.id),
       );
-      return sensor && (sensor.temperature > 27 || sensor.soilMoisture < 45)
-        ? [
-            {
-              id: container.id,
-              message: `${container.name} 환경 수치를 확인해 주세요.`,
-              level: "warning",
-            },
-          ]
-        : [];
-    });
-    const allOpenOrders = db
+      if (sensor && (sensor.temperature > 27 || sensor.soilMoisture < 45))
+        alerts.push({
+          id: container.id,
+          message: `${container.name} 환경 수치를 확인해 주세요.`,
+          level: "warning",
+        });
+    }
+    const allOpenOrderRows = await db
       .prepare(
         "SELECT * FROM orders WHERE seller_id=? AND status='판매중' ORDER BY created_at DESC",
       )
-      .all(req.user.id)
-      .map(orderView);
-    const reserved = reservedByToken(req.user.id);
-    const holdings = db
+      .all(req.user.id);
+    const allOpenOrders = await Promise.all(allOpenOrderRows.map(orderView));
+    const reserved = await reservedByToken(req.user.id);
+    const holdingRows = await db
       .prepare(
         "SELECT * FROM holdings WHERE user_id=? AND quantity>0 ORDER BY token_id",
       )
-      .all(req.user.id)
-      .map((row) => holdingView(row, reserved.get(row.token_id) || 0));
+      .all(req.user.id);
+    const holdings = await Promise.all(
+      holdingRows.map((row) => holdingView(row, reserved.get(row.token_id) || 0)),
+    );
     const holdingValue =
       holdings.reduce(
         (sum, holding) => sum + holding.quantity * holding.averagePrice,
@@ -914,21 +927,21 @@ export function createApp({
         (sum, order) => sum + order.quantity * order.unitPrice,
         0,
       );
-    const mockCreditBalance = getUser(req.user.id).credit_balance;
+    const mockCreditBalance = (await getUser(req.user.id)).credit_balance;
     const openOrderCount = allOpenOrders.length;
     const openOrders = allOpenOrders.slice(0, 3);
-    const recentTransactions = db
+    const recentTransactionRows = await db
       .prepare(
         "SELECT * FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 3",
       )
-      .all(req.user.id)
-      .map((row) => ({
-        ...row,
-        userId: row.user_id,
-        tokenId: row.token_id,
-        unitPrice: row.unit_price,
-        createdAt: row.created_at,
-      }));
+      .all(req.user.id);
+    const recentTransactions = recentTransactionRows.map((row) => ({
+      ...row,
+      userId: row.user_id,
+      tokenId: row.token_id,
+      unitPrice: row.unit_price,
+      createdAt: row.created_at,
+    }));
     res.json({
       wallet: {
         linkedAccount: null,
@@ -950,8 +963,8 @@ export function createApp({
   });
   // Real-time browser channel. A connected browser receives a sensor snapshot,
   // device updates and controller acknowledgements as Server-Sent Events.
-  app.post("/api/containers/:id/live-ticket", auth, (req, res) => {
-    if (!getContainer(req.params.id))
+  app.post("/api/containers/:id/live-ticket", auth, async (req, res) => {
+    if (!(await getContainer(req.params.id)))
       return res.status(404).json({ message: "컨테이너를 찾을 수 없습니다." });
     const ticket = randomBytes(24).toString("base64url");
     streamTickets.set(ticket, {
@@ -961,8 +974,8 @@ export function createApp({
     });
     res.json({ ticket, expiresIn: 60 });
   });
-  app.get("/api/containers/:id/live", liveTicketAuth, (req, res) => {
-    if (!getContainer(req.params.id))
+  app.get("/api/containers/:id/live", liveTicketAuth, async (req, res) => {
+    if (!(await getContainer(req.params.id)))
       return res.status(404).json({ message: "컨테이너를 찾을 수 없습니다." });
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -973,7 +986,7 @@ export function createApp({
     const send = (event) =>
       res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     const sensor = sensorView(
-      db
+      await db
         .prepare("SELECT * FROM sensor_readings WHERE container_id=?")
         .get(req.params.id),
     );
@@ -992,10 +1005,10 @@ export function createApp({
       realtime.off(`container:${req.params.id}`, listener);
     });
   });
-  app.get("/api/containers/:id/camera", auth, (req, res) => {
-    if (!getContainer(req.params.id))
+  app.get("/api/containers/:id/camera", auth, async (req, res) => {
+    if (!(await getContainer(req.params.id)))
       return res.status(404).json({ message: "컨테이너를 찾을 수 없습니다." });
-    const camera = db
+    const camera = await db
       .prepare("SELECT * FROM camera_streams WHERE container_id=?")
       .get(req.params.id);
     res.json(
@@ -1016,7 +1029,7 @@ export function createApp({
   });
   // Hardware gateway endpoints: sensor firmware sends readings here using a
   // per-device key; controllers poll their command queue and acknowledge work.
-  app.post("/api/iot/ingest/sensors", deviceAuth(["sensor"]), (req, res) => {
+  app.post("/api/iot/ingest/sensors", deviceAuth(["sensor"]), async (req, res) => {
     const payload = sensorPayload(req.body);
     if (!payload)
       return res
@@ -1024,9 +1037,9 @@ export function createApp({
         .json({ message: "센서 값 범위가 올바르지 않습니다." });
     const device = req.device;
     const timestamp = now();
-    store.transaction(() => {
+    await store.transaction(async () => {
       const current = sensorView(
-        db
+        await db
           .prepare("SELECT * FROM sensor_readings WHERE container_id=?")
           .get(device.container_id),
       );
@@ -1034,31 +1047,35 @@ export function createApp({
         ...(current?.history || []).slice(-7),
         payload.temperature,
       ];
-      db.prepare(
-        "INSERT INTO sensor_readings (container_id,temperature,humidity,light,co2,soil_moisture,ph,ec,history_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(container_id) DO UPDATE SET temperature=excluded.temperature,humidity=excluded.humidity,light=excluded.light,co2=excluded.co2,soil_moisture=excluded.soil_moisture,ph=excluded.ph,ec=excluded.ec,history_json=excluded.history_json,updated_at=excluded.updated_at",
-      ).run(
-        device.container_id,
-        payload.temperature,
-        payload.humidity,
-        payload.light,
-        payload.co2,
-        payload.soilMoisture,
-        payload.ph,
-        payload.ec,
-        JSON.stringify(history),
-        timestamp,
-      );
+      await db
+        .prepare(
+          "INSERT INTO sensor_readings (container_id,temperature,humidity,light,co2,soil_moisture,ph,ec,history_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(container_id) DO UPDATE SET temperature=excluded.temperature,humidity=excluded.humidity,light=excluded.light,co2=excluded.co2,soil_moisture=excluded.soil_moisture,ph=excluded.ph,ec=excluded.ec,history_json=excluded.history_json,updated_at=excluded.updated_at",
+        )
+        .run(
+          device.container_id,
+          payload.temperature,
+          payload.humidity,
+          payload.light,
+          payload.co2,
+          payload.soilMoisture,
+          payload.ph,
+          payload.ec,
+          JSON.stringify(history),
+          timestamp,
+        );
       const eventId = randomUUID();
-      db.prepare(
-        "INSERT INTO sensor_events (id,container_id,device_id,payload_json,created_at) VALUES (?,?,?,?,?)",
-      ).run(
-        eventId,
-        device.container_id,
-        device.id,
-        JSON.stringify(payload),
-        timestamp,
-      );
-      store.appendBlock("SENSOR_READING", "sensor_event", eventId, {
+      await db
+        .prepare(
+          "INSERT INTO sensor_events (id,container_id,device_id,payload_json,created_at) VALUES (?,?,?,?,?)",
+        )
+        .run(
+          eventId,
+          device.container_id,
+          device.id,
+          JSON.stringify(payload),
+          timestamp,
+        );
+      await store.appendBlock("SENSOR_READING", "sensor_event", eventId, {
         containerId: device.container_id,
         deviceId: device.id,
         ...payload,
@@ -1066,7 +1083,7 @@ export function createApp({
       });
     });
     const sensor = sensorView(
-      db
+      await db
         .prepare("SELECT * FROM sensor_readings WHERE container_id=?")
         .get(device.container_id),
     );
@@ -1076,26 +1093,26 @@ export function createApp({
   app.get(
     "/api/iot/commands/pending",
     deviceAuth(["controller"]),
-    (req, res) => {
-      const commands = db
+    async (req, res) => {
+      const rows = await db
         .prepare(
           "SELECT * FROM control_commands WHERE container_id=? AND status='queued' ORDER BY requested_at LIMIT 20",
         )
-        .all(req.device.container_id)
-        .map((row) => ({
-          id: row.id,
-          containerId: row.container_id,
-          command: JSON.parse(row.command_json),
-          requestedAt: row.requested_at,
-        }));
+        .all(req.device.container_id);
+      const commands = rows.map((row) => ({
+        id: row.id,
+        containerId: row.container_id,
+        command: JSON.parse(row.command_json),
+        requestedAt: row.requested_at,
+      }));
       res.json({ commands, serverTime: now() });
     },
   );
   app.post(
     "/api/iot/commands/:id/ack",
     deviceAuth(["controller"]),
-    (req, res) => {
-      const command = db
+    async (req, res) => {
+      const command = await db
         .prepare(
           "SELECT * FROM control_commands WHERE id=? AND container_id=? AND status='queued'",
         )
@@ -1107,16 +1124,18 @@ export function createApp({
       const status = req.body?.success === false ? "failed" : "acknowledged";
       const result = text(req.body?.message, 300);
       const acknowledgedAt = now();
-      store.transaction(() => {
-        db.prepare(
-          "UPDATE control_commands SET status=?,acknowledged_at=?,result_json=? WHERE id=?",
-        ).run(
-          status,
-          acknowledgedAt,
-          JSON.stringify({ message: result }),
-          command.id,
-        );
-        store.appendBlock("CONTROL_ACK", "control_command", command.id, {
+      await store.transaction(async () => {
+        await db
+          .prepare(
+            "UPDATE control_commands SET status=?,acknowledged_at=?,result_json=? WHERE id=?",
+          )
+          .run(
+            status,
+            acknowledgedAt,
+            JSON.stringify({ message: result }),
+            command.id,
+          );
+        await store.appendBlock("CONTROL_ACK", "control_command", command.id, {
           deviceId: req.device.id,
           status,
           result,
@@ -1133,199 +1152,166 @@ export function createApp({
     },
   );
 
-  app.get("/api/blockchain/verify", auth, (_req, res) =>
-    res.json(store.verifyBlockchain()),
+  app.get("/api/ledger/verify", auth, async (_req, res) =>
+    res.json(await store.verifyBlockchain()),
   );
-  app.get("/api/blockchain/blocks", auth, admin, (req, res) => {
+  app.get("/api/ledger/blocks", auth, admin, async (req, res) => {
     const limit = Math.min(100, positiveInt(req.query.limit) || 30);
-    const blocks = db
+    const rows = await db
       .prepare(
         "SELECT height,previous_hash,payload_hash,block_hash,signature,event_type,entity_type,entity_id,created_at FROM blockchain_blocks ORDER BY height DESC LIMIT ?",
       )
-      .all(limit)
-      .map((block) => ({
-        height: block.height,
-        previousHash: block.previous_hash,
-        payloadHash: block.payload_hash,
-        blockHash: block.block_hash,
-        signature: block.signature,
-        eventType: block.event_type,
-        entityType: block.entity_type,
-        entityId: block.entity_id,
-        createdAt: block.created_at,
-      }));
-    res.json({ verification: store.verifyBlockchain(), blocks });
+      .all(limit);
+    const blocks = rows.map((block) => ({
+      height: block.height,
+      previousHash: block.previous_hash,
+      payloadHash: block.payload_hash,
+      blockHash: block.block_hash,
+      signature: block.signature,
+      eventType: block.event_type,
+      entityType: block.entity_type,
+      entityId: block.entity_id,
+      createdAt: block.created_at,
+    }));
+    res.json({ verification: await store.verifyBlockchain(), blocks });
   });
-  app.get("/api/public-chain/operations", auth, admin, (req, res) => {
-    const limit = Math.min(100, positiveInt(req.query.limit) || 30);
-    const rows = db
+  // Raw table browser for the dev admin console (admin.html) — not a real
+  // DBMS replacement, just "let me see what's actually in the DB" without
+  // opening psql. Table name is only ever used after an allowlist lookup
+  // (never interpolated from user input directly), so this can't be used to
+  // query arbitrary tables.
+  const DB_BROWSE_TABLES = {
+    users: "created_at",
+    farms: "created_at",
+    containers: "created_at",
+    container_page_content: "updated_at",
+    sensor_readings: "updated_at",
+    holdings: null,
+    orders: "created_at",
+    transactions: "created_at",
+    container_tokens: "created_at",
+    token_positions: "updated_at",
+    token_orders: "created_at",
+    token_executions: "executed_at",
+    settlements: "created_at",
+    credit_ledger_entries: "created_at",
+    token_ledger_entries: "created_at",
+    idempotency_keys: "created_at",
+    sessions: "created_at",
+    audit_logs: "created_at",
+    blockchain_blocks: "created_at",
+    iot_devices: "created_at",
+    sensor_events: "created_at",
+    control_commands: "requested_at",
+    camera_streams: null,
+    public_chain_operations: "created_at",
+    transaction_anchor_batches: "created_at",
+  };
+  // Dumps raw rows including password_hash — fine for the dev console
+  // against a demo DB, not something to leave reachable in a real
+  // deployment, so it's a 404 (not just unauthorized) once NODE_ENV is
+  // "production".
+  const devOnly = (_req, res, next) =>
+    production
+      ? res.status(404).json({ message: "찾을 수 없습니다." })
+      : next();
+  app.get("/api/admin/demo-accounts", devOnly, auth, admin, (_req, res) => {
+    res.json(demoAccounts);
+  });
+  app.get("/api/admin/db/tables", devOnly, auth, admin, (_req, res) => {
+    res.json(Object.keys(DB_BROWSE_TABLES));
+  });
+  app.get("/api/admin/db/:table", devOnly, auth, admin, async (req, res) => {
+    const table = req.params.table;
+    if (!Object.prototype.hasOwnProperty.call(DB_BROWSE_TABLES, table))
+      return res.status(404).json({ message: "알 수 없는 테이블입니다." });
+    const limit = Math.min(500, positiveInt(req.query.limit) || 100);
+    const orderBy = DB_BROWSE_TABLES[table];
+    const sql = orderBy
+      ? `SELECT * FROM ${table} ORDER BY ${orderBy} DESC LIMIT ?`
+      : `SELECT * FROM ${table} LIMIT ?`;
+    const rows = await db.prepare(sql).all(limit);
+    res.json(rows);
+  });
+  app.get("/api/admin/executions", auth, admin, async (req, res) => {
+    const limit = Math.min(300, positiveInt(req.query.limit) || 100);
+    const rows = await db
       .prepare(
-        "SELECT * FROM public_chain_operations ORDER BY created_at DESC LIMIT ?",
+        `SELECT e.id,e.token_id,e.quantity,e.unit_price,e.executed_at,
+                e.buyer_id,bu.name AS buyer_name,bu.email AS buyer_email,
+                e.seller_id,su.name AS seller_name,su.email AS seller_email,
+                e.anchored_batch_id,o.status AS anchor_status,o.tx_hash,o.block_number,b.merkle_root
+           FROM token_executions e
+           JOIN users bu ON bu.id=e.buyer_id
+           JOIN users su ON su.id=e.seller_id
+           LEFT JOIN transaction_anchor_batches b ON b.id=e.anchored_batch_id
+           LEFT JOIN public_chain_operations o ON o.id=b.operation_id
+          ORDER BY e.executed_at DESC LIMIT ?`,
       )
       .all(limit);
     res.json(
       rows.map((row) => ({
         id: row.id,
-        operationType: row.operation_type,
-        entityType: row.entity_type,
-        entityId: row.entity_id,
-        payload: JSON.parse(row.payload_json),
-        status: row.status,
+        tokenId: row.token_id,
+        quantity: row.quantity,
+        unitPrice: row.unit_price,
+        totalAmount: row.quantity * row.unit_price,
+        executedAt: row.executed_at,
+        buyerId: row.buyer_id,
+        buyerName: row.buyer_name,
+        buyerEmail: row.buyer_email,
+        sellerId: row.seller_id,
+        sellerName: row.seller_name,
+        sellerEmail: row.seller_email,
+        anchorBatchId: row.anchored_batch_id,
+        anchorStatus: row.anchor_status || "pending",
         txHash: row.tx_hash,
         blockNumber: row.block_number,
-        attempts: row.attempts,
-        error: row.error_message,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
+        merkleRoot: row.merkle_root,
       })),
     );
   });
-  app.post("/api/public-chain/marketplace/confirm", auth, async (req, res) => {
-    const txHash = text(req.body?.txHash, 70);
-    if (!/^0x[0-9a-fA-F]{64}$/.test(txHash))
-      return res
-        .status(400)
-        .json({ message: "유효한 EVM transaction hash가 필요합니다." });
-    const duplicate = db
-      .prepare("SELECT * FROM public_chain_operations WHERE tx_hash=?")
-      .get(txHash);
-    if (duplicate)
-      return res.json({
-        status: duplicate.status,
-        txHash: duplicate.tx_hash,
-        blockNumber: duplicate.block_number,
-      });
+  app.get("/api/admin/chain-anchor/batches", auth, admin, async (req, res) => {
+    const limit = Math.min(100, positiveInt(req.query.limit) || 30);
+    const rows = await db
+      .prepare(
+        `SELECT b.id,b.from_execution_id,b.to_execution_id,b.execution_count,b.merkle_root,b.created_at,
+                o.status,o.tx_hash,o.block_number,o.error_message
+           FROM transaction_anchor_batches b
+           JOIN public_chain_operations o ON o.id=b.operation_id
+          ORDER BY b.created_at DESC LIMIT ?`,
+      )
+      .all(limit);
+    res.json(
+      rows.map((row) => ({
+        id: row.id,
+        fromExecutionId: row.from_execution_id,
+        toExecutionId: row.to_execution_id,
+        executionCount: row.execution_count,
+        merkleRoot: row.merkle_root,
+        status: row.status,
+        txHash: row.tx_hash,
+        blockNumber: row.block_number,
+        errorMessage: row.error_message,
+        createdAt: row.created_at,
+      })),
+    );
+  });
+  app.post("/api/admin/chain-anchor/run", auth, admin, async (_req, res) => {
     try {
-      const result = await publicChain.confirmMarketplaceTransaction(txHash);
-      const id = `chain-${randomUUID().slice(0, 12)}`,
-        timestamp = now();
-      store.transaction(() => {
-        db.prepare(
-          "INSERT INTO public_chain_operations (id,operation_type,entity_type,entity_id,payload_json,status,tx_hash,block_number,attempts,created_at,updated_at) VALUES (?,?,?,?,?,'confirmed',?,?,1,?,?)",
-        ).run(
-          id,
-          `MARKETPLACE_${result.eventName.toUpperCase()}`,
-          "marketplace_transaction",
-          txHash,
-          JSON.stringify({ actorId: req.user.id, ...result }),
-          txHash,
-          result.blockNumber,
-          timestamp,
-          timestamp,
-        );
-        store.appendBlock(
-          "PUBLIC_MARKETPLACE_CONFIRMED",
-          "marketplace_transaction",
-          txHash,
-          { actorId: req.user.id, ...result },
-        );
-      });
-      res.json({ status: "confirmed", ...result });
+      const result = await anchorPendingExecutions(store);
+      res.json(result || { message: "앵커링할 거래내역이 없습니다." });
     } catch (error) {
-      res.status(422).json({ message: String(error.message || error) });
+      console.error("Chain anchor run failed:", error);
+      res.status(502).json({ message: "체인 앵커링에 실패했습니다." });
     }
   });
-  app.post(
-    "/api/admin/public-chain/process-next",
-    auth,
-    admin,
-    async (_req, res) => {
-      if (!publicChain.relayerEnabled)
-        return res.status(503).json({
-          message: "퍼블릭 체인 환경변수가 설정되지 않았습니다.",
-          chain: publicChain.status(),
-        });
-      const result = await processNextChainOperation(store, publicChain);
-      res.json(
-        result || { status: "idle", message: "처리할 outbox 작업이 없습니다." },
-      );
-    },
-  );
-  app.post(
-    "/api/admin/public-chain/sensor-batches",
-    auth,
-    admin,
-    (req, res) => {
-      const containerId = text(req.body?.containerId, 50),
-        maxReadings = Math.min(500, positiveInt(req.body?.maxReadings) || 100);
-      if (!getContainer(containerId))
-        return res
-          .status(404)
-          .json({ message: "컨테이너를 찾을 수 없습니다." });
-      const events = db
-        .prepare(
-          "SELECT id,container_id,device_id,payload_json,created_at FROM sensor_events WHERE container_id=? AND anchored_batch_id IS NULL ORDER BY created_at,id LIMIT ?",
-        )
-        .all(containerId, maxReadings);
-      if (!events.length)
-        return res
-          .status(409)
-          .json({ message: "아직 anchor하지 않은 센서 기록이 없습니다." });
-      const records = events.map((event) => ({
-        id: event.id,
-        containerId: event.container_id,
-        deviceId: event.device_id,
-        payload: JSON.parse(event.payload_json),
-        createdAt: event.created_at,
-      }));
-      const root = merkleRoot(records),
-        batchId = `batch-${randomUUID().slice(0, 12)}`,
-        createdAt = now();
-      const operation = store.transaction(() => {
-        const queued = store.enqueueChainOperation(
-          "ANCHOR_SENSOR_BATCH",
-          "sensor_batch",
-          batchId,
-          {
-            containerId,
-            merkleRoot: root,
-            fromTimestamp: events[0].created_at,
-            toTimestamp: events.at(-1).created_at,
-            readingCount: events.length,
-          },
-        );
-        db.prepare(
-          "INSERT INTO sensor_anchor_batches VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ).run(
-          batchId,
-          containerId,
-          events[0].id,
-          events.at(-1).id,
-          events[0].created_at,
-          events.at(-1).created_at,
-          events.length,
-          root,
-          queued.id,
-          createdAt,
-        );
-        const placeholders = events.map(() => "?").join(",");
-        db.prepare(
-          `UPDATE sensor_events SET anchored_batch_id=? WHERE id IN (${placeholders})`,
-        ).run(batchId, ...events.map((event) => event.id));
-        store.appendBlock("SENSOR_BATCH_QUEUED", "sensor_batch", batchId, {
-          containerId,
-          merkleRoot: root,
-          readingCount: events.length,
-          operationId: queued.id,
-        });
-        return queued;
-      });
-      res.status(202).json({
-        batchId,
-        containerId,
-        merkleRoot: root,
-        readingCount: events.length,
-        operation,
-      });
-    },
-  );
-
-  app.post("/api/admin/iot/devices", auth, admin, (req, res) => {
+  app.post("/api/admin/iot/devices", auth, admin, async (req, res) => {
     const containerId = text(req.body?.containerId, 50),
       name = text(req.body?.name, 60),
       deviceType = text(req.body?.deviceType, 20);
     if (
-      !getContainer(containerId) ||
+      !(await getContainer(containerId)) ||
       !name ||
       !["sensor", "controller", "camera"].includes(deviceType)
     )
@@ -1335,23 +1321,23 @@ export function createApp({
     const rawKey = `glk_${randomBytes(32).toString("base64url")}`;
     const timestamp = now();
     const id = `dev-${randomUUID().slice(0, 12)}`;
-    db.prepare(
-      "INSERT INTO iot_devices VALUES (?,?,?,?,?,?,'offline',NULL,?,?)",
-    ).run(
-      id,
-      containerId,
-      name,
-      deviceType,
-      tokenHash(rawKey),
-      rawKey.slice(0, 12),
-      timestamp,
-      timestamp,
-    );
-    audit(req, "PROVISION_IOT_DEVICE", "iot_device", id, {
+    await db
+      .prepare("INSERT INTO iot_devices VALUES (?,?,?,?,?,?,'offline',NULL,?,?)")
+      .run(
+        id,
+        containerId,
+        name,
+        deviceType,
+        tokenHash(rawKey),
+        rawKey.slice(0, 12),
+        timestamp,
+        timestamp,
+      );
+    await audit(req, "PROVISION_IOT_DEVICE", "iot_device", id, {
       containerId,
       deviceType,
     });
-    store.appendBlock("DEVICE_PROVISIONED", "iot_device", id, {
+    await store.appendBlock("DEVICE_PROVISIONED", "iot_device", id, {
       containerId,
       deviceType,
       keyPrefix: rawKey.slice(0, 12),
@@ -1366,44 +1352,148 @@ export function createApp({
         "이 인증키는 지금 한 번만 표시됩니다. 장비의 안전한 저장소에 보관하세요.",
     });
   });
-  app.get("/api/admin/iot/devices", auth, admin, (_req, res) => {
-    const devices = db
+  app.get("/api/admin/users", auth, admin, async (req, res) => {
+    const limit = Math.min(200, positiveInt(req.query.limit) || 100);
+    const rows = await db
+      .prepare(
+        "SELECT id,name,email,role,phone,credit_balance,status,last_login_at,created_at,updated_at FROM users ORDER BY created_at DESC LIMIT ?",
+      )
+      .all(limit);
+    res.json(
+      rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        role: row.role,
+        phone: row.phone,
+        creditBalance: row.credit_balance,
+        status: row.status,
+        lastLoginAt: row.last_login_at,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      })),
+    );
+  });
+  // Admin password reset: overwrites the hash with a new one the admin
+  // chooses. Doesn't need (and can't use) the old password — see
+  // /api/me/password below for the self-service version that does check the
+  // current one. Revokes the user's existing sessions the same way a normal
+  // password change does.
+  app.post(
+    "/api/admin/users/:id/reset-password",
+    auth,
+    admin,
+    async (req, res) => {
+      const target = await getUser(req.params.id);
+      if (!target)
+        return res.status(404).json({ message: "사용자를 찾을 수 없습니다." });
+      const newPassword =
+        typeof req.body?.newPassword === "string"
+          ? req.body.newPassword.normalize("NFC")
+          : "";
+      const problem = passwordProblem(newPassword);
+      if (problem) return res.status(400).json({ message: problem });
+      const passwordHash = await hashPasswordStrong(newPassword);
+      const changedAt = now();
+      await store.transaction(async () => {
+        await db
+          .prepare(
+            "UPDATE users SET password_hash=?,password_changed_at=?,updated_at=? WHERE id=?",
+          )
+          .run(passwordHash, changedAt, changedAt, target.id);
+        await db
+          .prepare("DELETE FROM sessions WHERE user_id=?")
+          .run(target.id);
+        await audit(req, "ADMIN_RESET_PASSWORD", "user", target.id, {});
+      });
+      res.status(204).end();
+    },
+  );
+  app.get("/api/admin/sessions", auth, admin, async (req, res) => {
+    const limit = Math.min(200, positiveInt(req.query.limit) || 100);
+    const rows = await db
+      .prepare(
+        `SELECT s.user_id,u.name,u.email,u.role,s.expires_at,s.created_at
+           FROM sessions s JOIN users u ON u.id=s.user_id
+          WHERE s.expires_at > ?
+          ORDER BY s.created_at DESC LIMIT ?`,
+      )
+      .all(now(), limit);
+    res.json(
+      rows.map((row) => ({
+        userId: row.user_id,
+        name: row.name,
+        email: row.email,
+        role: row.role,
+        expiresAt: row.expires_at,
+        createdAt: row.created_at,
+      })),
+    );
+  });
+  app.get("/api/admin/audit-logs", auth, admin, async (req, res) => {
+    const limit = Math.min(200, positiveInt(req.query.limit) || 100);
+    const action = text(req.query.action, 40);
+    const rows = await db
+      .prepare(
+        `SELECT a.id,a.actor_id,u.name AS actor_name,u.email AS actor_email,a.action,a.entity_type,a.entity_id,a.metadata_json,a.created_at
+           FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id
+          WHERE (?='' OR a.action=?)
+          ORDER BY a.created_at DESC LIMIT ?`,
+      )
+      .all(action, action, limit);
+    res.json(
+      rows.map((row) => ({
+        id: row.id,
+        actorId: row.actor_id,
+        actorName: row.actor_name,
+        actorEmail: row.actor_email,
+        action: row.action,
+        entityType: row.entity_type,
+        entityId: row.entity_id,
+        metadata: JSON.parse(row.metadata_json),
+        createdAt: row.created_at,
+      })),
+    );
+  });
+  app.get("/api/admin/iot/devices", auth, admin, async (_req, res) => {
+    const rows = await db
       .prepare(
         "SELECT id,container_id,name,device_type,key_prefix,status,last_seen_at,created_at,updated_at FROM iot_devices ORDER BY created_at DESC",
       )
-      .all()
-      .map((row) => ({
-        id: row.id,
-        containerId: row.container_id,
-        name: row.name,
-        deviceType: row.device_type,
-        keyPrefix: row.key_prefix,
-        status: row.status,
-        lastSeenAt: row.last_seen_at,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-      }));
+      .all();
+    const devices = rows.map((row) => ({
+      id: row.id,
+      containerId: row.container_id,
+      name: row.name,
+      deviceType: row.device_type,
+      keyPrefix: row.key_prefix,
+      status: row.status,
+      lastSeenAt: row.last_seen_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
     res.json(devices);
   });
-  app.get("/api/admin/summary", auth, admin, (_req, res) => {
-    const scalar = (sql) => Number(Object.values(db.prepare(sql).get())[0]);
+  app.get("/api/admin/summary", auth, admin, async (_req, res) => {
+    const scalar = async (sql) =>
+      Number(Object.values(await db.prepare(sql).get())[0]);
     res.json({
-      farmCount: scalar("SELECT COUNT(*) FROM farms"),
-      containerCount: scalar("SELECT COUNT(*) FROM containers"),
-      issuedTokens: scalar(
+      farmCount: await scalar("SELECT COUNT(*) FROM farms"),
+      containerCount: await scalar("SELECT COUNT(*) FROM containers"),
+      issuedTokens: await scalar(
         "SELECT COALESCE(SUM(total_token_supply),0) FROM containers",
       ),
-      onlineDevices: scalar(
+      onlineDevices: await scalar(
         "SELECT COUNT(*) FROM iot_devices WHERE status='online'",
       ),
-      queuedCommands: scalar(
+      queuedCommands: await scalar(
         "SELECT COUNT(*) FROM control_commands WHERE status='queued'",
       ),
-      ledgerBlocks: scalar("SELECT COUNT(*) FROM blockchain_blocks"),
+      ledgerBlocks: await scalar("SELECT COUNT(*) FROM blockchain_blocks"),
     });
   });
-  app.get("/api/admin/control-commands", auth, admin, (_req, res) => {
-    const rows = db
+  app.get("/api/admin/control-commands", auth, admin, async (_req, res) => {
+    const rows = await db
       .prepare(
         "SELECT id,container_id,command_json,status,requested_at,acknowledged_at,result_json FROM control_commands ORDER BY requested_at DESC LIMIT 50",
       )
@@ -1420,11 +1510,11 @@ export function createApp({
       })),
     );
   });
-  app.post("/api/containers/:id/climate/commands", auth, (req, res) => {
-    const container = getContainer(req.params.id);
+  app.post("/api/containers/:id/climate/commands", auth, async (req, res) => {
+    const container = await getContainer(req.params.id);
     if (!container)
       return res.status(404).json({ message: "컨테이너를 찾을 수 없습니다." });
-    const farm = getFarm(container.farm_id);
+    const farm = await getFarm(container.farm_id);
     if (req.user.role !== "admin" && farm?.owner_id !== req.user.id)
       return res
         .status(403)
@@ -1460,24 +1550,26 @@ export function createApp({
     };
     const id = `cmd-${randomUUID().slice(0, 12)}`,
       requestedAt = now();
-    store.transaction(() => {
-      db.prepare(
-        "INSERT INTO control_commands (id,container_id,requested_by,command_json,status,requested_at) VALUES (?,?,?,?,?,?)",
-      ).run(
-        id,
-        req.params.id,
-        req.user.id,
-        JSON.stringify(command),
-        "queued",
-        requestedAt,
-      );
-      store.appendBlock("CLIMATE_CONTROL_COMMAND", "control_command", id, {
+    await store.transaction(async () => {
+      await db
+        .prepare(
+          "INSERT INTO control_commands (id,container_id,requested_by,command_json,status,requested_at) VALUES (?,?,?,?,?,?)",
+        )
+        .run(
+          id,
+          req.params.id,
+          req.user.id,
+          JSON.stringify(command),
+          "queued",
+          requestedAt,
+        );
+      await store.appendBlock("CLIMATE_CONTROL_COMMAND", "control_command", id, {
         containerId: req.params.id,
         requestedBy: req.user.id,
         ...command,
         requestedAt,
       });
-      audit(req, "CLIMATE_CONTROL_COMMAND", "control_command", id, command);
+      await audit(req, "CLIMATE_CONTROL_COMMAND", "control_command", id, command);
     });
     publish(req.params.id, "control_command", {
       id,
@@ -1493,8 +1585,8 @@ export function createApp({
       requestedAt,
     });
   });
-  app.put("/api/admin/cameras/:containerId", auth, admin, (req, res) => {
-    if (!getContainer(req.params.containerId))
+  app.put("/api/admin/cameras/:containerId", auth, admin, async (req, res) => {
+    if (!(await getContainer(req.params.containerId)))
       return res.status(404).json({ message: "컨테이너를 찾을 수 없습니다." });
     const hlsUrl = text(req.body?.hlsUrl, 500);
     let url;
@@ -1515,10 +1607,12 @@ export function createApp({
       });
     const status = req.body?.status === "offline" ? "offline" : "online",
       timestamp = now();
-    db.prepare(
-      "INSERT INTO camera_streams VALUES (?,?,?,?) ON CONFLICT(container_id) DO UPDATE SET hls_url=excluded.hls_url,status=excluded.status,updated_at=excluded.updated_at",
-    ).run(req.params.containerId, hlsUrl, status, timestamp);
-    audit(req, "CONFIGURE_CAMERA", "camera", req.params.containerId, {
+    await db
+      .prepare(
+        "INSERT INTO camera_streams VALUES (?,?,?,?) ON CONFLICT(container_id) DO UPDATE SET hls_url=excluded.hls_url,status=excluded.status,updated_at=excluded.updated_at",
+      )
+      .run(req.params.containerId, hlsUrl, status, timestamp);
+    await audit(req, "CONFIGURE_CAMERA", "camera", req.params.containerId, {
       hlsUrl,
       status,
     });
@@ -1530,11 +1624,11 @@ export function createApp({
     });
   });
 
-  app.post("/api/admin/farms", auth, admin, (req, res) => {
+  app.post("/api/admin/farms", auth, admin, async (req, res) => {
     const name = text(req.body?.name, 60),
       address = text(req.body?.address, 120),
       ownerId = text(req.body?.ownerId, 40) || "admin";
-    if (!name || !address || !getUser(ownerId))
+    if (!name || !address || !(await getUser(ownerId)))
       return res
         .status(400)
         .json({ message: "농장명, 주소, 운영자를 확인해 주세요." });
@@ -1552,26 +1646,28 @@ export function createApp({
       createdAt,
       updatedAt: createdAt,
     };
-    db.prepare("INSERT INTO farms VALUES (?,?,?,?,?,?,?,?,?,?)").run(
-      row.id,
-      row.name,
-      row.address,
-      row.latitude,
-      row.longitude,
-      row.status,
-      row.description,
-      row.ownerId,
-      row.createdAt,
-      row.updatedAt,
-    );
-    audit(req, "CREATE", "farm", id, row);
+    await db
+      .prepare("INSERT INTO farms VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run(
+        row.id,
+        row.name,
+        row.address,
+        row.latitude,
+        row.longitude,
+        row.status,
+        row.description,
+        row.ownerId,
+        row.createdAt,
+        row.updatedAt,
+      );
+    await audit(req, "CREATE", "farm", id, row);
     res.status(201).json(row);
   });
-  app.post("/api/admin/containers", auth, admin, (req, res) => {
+  app.post("/api/admin/containers", auth, admin, async (req, res) => {
     const farmId = text(req.body?.farmId, 50),
       name = text(req.body?.name, 60),
       cropName = text(req.body?.cropName, 40);
-    if (!getFarm(farmId) || !name || !cropName)
+    if (!(await getFarm(farmId)) || !name || !cropName)
       return res
         .status(400)
         .json({ message: "농장과 컨테이너 정보를 확인해 주세요." });
@@ -1593,34 +1689,34 @@ export function createApp({
       createdAt,
       updatedAt: createdAt,
     };
-    store.transaction(() => {
-      db.prepare(
-        "INSERT INTO containers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      ).run(
-        row.id,
-        row.farmId,
-        row.name,
-        row.cropName,
-        row.status,
-        row.description,
-        row.plantedAt,
-        row.harvestAt,
-        row.tokenId,
-        row.totalTokenSupply,
-        row.availableTokenQuantity,
-        row.tokenPrice,
-        row.createdAt,
-        row.updatedAt,
-      );
-      db.prepare(
-        "INSERT INTO sensor_readings VALUES (?,?,?,?,?,?,?,?,?,?)",
-      ).run(row.id, 0, 0, 0, 0, 0, 0, 0, "[]", createdAt);
-      audit(req, "CREATE", "container", id, row);
+    await store.transaction(async () => {
+      await db
+        .prepare("INSERT INTO containers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .run(
+          row.id,
+          row.farmId,
+          row.name,
+          row.cropName,
+          row.status,
+          row.description,
+          row.plantedAt,
+          row.harvestAt,
+          row.tokenId,
+          row.totalTokenSupply,
+          row.availableTokenQuantity,
+          row.tokenPrice,
+          row.createdAt,
+          row.updatedAt,
+        );
+      await db
+        .prepare("INSERT INTO sensor_readings VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .run(row.id, 0, 0, 0, 0, 0, 0, 0, "[]", createdAt);
+      await audit(req, "CREATE", "container", id, row);
     });
     res.status(201).json(row);
   });
-  app.patch("/api/admin/containers/:id/content", auth, admin, (req, res) => {
-    const container = getContainer(req.params.id);
+  app.patch("/api/admin/containers/:id/content", auth, admin, async (req, res) => {
+    const container = await getContainer(req.params.id);
     if (!container)
       return res.status(404).json({ message: "컨테이너를 찾을 수 없습니다." });
     const description = text(req.body?.description, 500);
@@ -1639,22 +1735,24 @@ export function createApp({
         .status(400)
         .json({ message: "랙 4개의 이름과 설명을 모두 입력해 주세요." });
     const updatedAt = now();
-    store.transaction(() => {
-      db.prepare(
-        "UPDATE containers SET description=?,updated_at=? WHERE id=?",
-      ).run(description, updatedAt, container.id);
-      db.prepare(
-        "INSERT INTO container_page_content (container_id,rack_views_json,updated_at) VALUES (?,?,?) ON CONFLICT(container_id) DO UPDATE SET rack_views_json=excluded.rack_views_json,updated_at=excluded.updated_at",
-      ).run(container.id, JSON.stringify(rackViews), updatedAt);
-      audit(req, "UPDATE_PAGE_CONTENT", "container", container.id, {
+    await store.transaction(async () => {
+      await db
+        .prepare("UPDATE containers SET description=?,updated_at=? WHERE id=?")
+        .run(description, updatedAt, container.id);
+      await db
+        .prepare(
+          "INSERT INTO container_page_content (container_id,rack_views_json,updated_at) VALUES (?,?,?) ON CONFLICT(container_id) DO UPDATE SET rack_views_json=excluded.rack_views_json,updated_at=excluded.updated_at",
+        )
+        .run(container.id, JSON.stringify(rackViews), updatedAt);
+      await audit(req, "UPDATE_PAGE_CONTENT", "container", container.id, {
         description,
         rackViews,
       });
     });
-    res.json(withFarm(getContainer(container.id)));
+    res.json(await withFarm(await getContainer(container.id)));
   });
-  app.get("/api/admin/token-requests", auth, admin, (req, res) => {
-    const rows = db
+  app.get("/api/admin/token-requests", auth, admin, async (req, res) => {
+    const rows = await db
       .prepare(
         `SELECT t.*,c.name AS container_name,c.crop_name,f.name AS farm_name,u.name AS issuer_name
            FROM container_tokens t
@@ -1664,8 +1762,9 @@ export function createApp({
           WHERE t.status='requested'
           ORDER BY t.created_at DESC`,
       )
-      .all()
-      .map((row) => ({
+      .all();
+    res.json(
+      rows.map((row) => ({
         id: row.id,
         containerId: row.container_id,
         containerName: row.container_name,
@@ -1680,81 +1779,54 @@ export function createApp({
         executionVenue: row.execution_venue,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
-      }));
-    res.json(rows);
+      })),
+    );
   });
-  const approveTokenRequest = (
+  const approveTokenRequest = async (
     req,
     res,
     containerId = req.body?.containerId,
   ) => {
     const id = text(containerId, 50);
-    const requestedToken = db
+    const requestedToken = await db
       .prepare(
         "SELECT total_supply,initial_price FROM container_tokens WHERE container_id=? AND status='requested'",
       )
       .get(id);
     const supply =
-      positiveInt(req.body?.supply) || requestedToken?.total_supply;
-    const price = positiveInt(req.body?.price) || requestedToken?.initial_price;
-    const container = getContainer(id);
-    const owner = container
-      ? db
-          .prepare(
-            "SELECT f.owner_id,u.name AS owner_name,u.wallet_address FROM containers c JOIN farms f ON f.id=c.farm_id JOIN users u ON u.id=f.owner_id WHERE c.id=?",
-          )
-          .get(id)
-      : null;
-    const recipient =
-      text(req.body?.recipientAddress, 50) || owner?.wallet_address;
-    if (publicChain.relayerEnabled && (!recipient || !isAddress(recipient)))
-      return res.status(400).json({
-        message:
-          "퍼블릭 체인 발행에는 농장 소유자의 연결된 EVM 지갑 또는 recipientAddress가 필요합니다.",
-      });
+      positiveInt(req.body?.supply, TRADING_LIMITS.maxQuantity) ||
+      requestedToken?.total_supply;
+    const price =
+      positiveInt(req.body?.price, TRADING_LIMITS.maxUnitPrice) ||
+      requestedToken?.initial_price;
     try {
-      const issued = trading.approveIssuance({
+      await trading.approveIssuance({
         approverId: req.user.id,
         containerId: id,
         supply,
         price,
-        queueChainOperation: publicChain.relayerEnabled
-          ? ({ container: issuedContainer, supply: issuedSupply }) =>
-              store.enqueueChainOperation(
-                "ISSUE_CONTAINER_TOKEN",
-                "container",
-                id,
-                {
-                  containerId: id,
-                  tokenId: issuedContainer.token_id,
-                  supply: issuedSupply,
-                  recipient: getAddress(recipient),
-                },
-              )
-          : null,
       });
       res.json({
-        ...containerMarketView(getContainer(id)),
-        publicChainOperation: issued.publicChainOperation,
+        ...(await containerMarketView(await getContainer(id))),
       });
     } catch (error) {
       tradingError(res, error, "토큰 발행 중 오류가 발생했습니다.");
     }
   };
-  app.post("/api/admin/tokens", auth, admin, (req, res) => {
-    approveTokenRequest(req, res);
+  app.post("/api/admin/tokens", auth, admin, async (req, res) => {
+    await approveTokenRequest(req, res);
   });
   app.post(
     "/api/admin/tokens/:containerId/approve",
     auth,
     admin,
-    (req, res) => {
-      approveTokenRequest(req, res, req.params.containerId);
+    async (req, res) => {
+      await approveTokenRequest(req, res, req.params.containerId);
     },
   );
-  app.patch("/api/admin/sensors/:containerId", auth, admin, (req, res) => {
+  app.patch("/api/admin/sensors/:containerId", auth, admin, async (req, res) => {
     const current = sensorView(
-      db
+      await db
         .prepare("SELECT * FROM sensor_readings WHERE container_id=?")
         .get(req.params.containerId),
     );
@@ -1776,21 +1848,23 @@ export function createApp({
         next[key] = Number(req.body[key]);
     next.updatedAt = now();
     next.history = [...next.history.slice(-7), next.temperature];
-    db.prepare(
-      "UPDATE sensor_readings SET temperature=?,humidity=?,light=?,co2=?,soil_moisture=?,ph=?,ec=?,history_json=?,updated_at=? WHERE container_id=?",
-    ).run(
-      next.temperature,
-      next.humidity,
-      next.light,
-      next.co2,
-      next.soilMoisture,
-      next.ph,
-      next.ec,
-      JSON.stringify(next.history),
-      next.updatedAt,
-      req.params.containerId,
-    );
-    audit(req, "UPDATE_SENSOR", "container", req.params.containerId, {});
+    await db
+      .prepare(
+        "UPDATE sensor_readings SET temperature=?,humidity=?,light=?,co2=?,soil_moisture=?,ph=?,ec=?,history_json=?,updated_at=? WHERE container_id=?",
+      )
+      .run(
+        next.temperature,
+        next.humidity,
+        next.light,
+        next.co2,
+        next.soilMoisture,
+        next.ph,
+        next.ec,
+        JSON.stringify(next.history),
+        next.updatedAt,
+        req.params.containerId,
+      );
+    await audit(req, "UPDATE_SENSOR", "container", req.params.containerId, {});
     res.json(next);
   });
 

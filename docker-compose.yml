@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: smartfarm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartfarm}
+      POSTGRES_DB: smartfarm
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartfarm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 4100
+      HOST: 0.0.0.0
+      # Demo deployment: NODE_ENV is intentionally left unset (not
+      # "production") so server/seed.js seeds the demo accounts/farms below.
+      # Flip to production + a real LEDGER_SIGNING_KEY once this is a real
+      # deployment instead of a same-day demo.
+      DATABASE_URL: postgres://smartfarm:${POSTGRES_PASSWORD:-smartfarm}@db:5432/smartfarm
+      SESSION_HOURS: "12"
+      LOGIN_ACCOUNT_SOURCE: database
+      LEDGER_SIGNING_KEY: ${LEDGER_SIGNING_KEY:-green-link-docker-demo-key-change-before-real-deployment}
+      PAYMENT_PROVIDER: mock
+      # Fabric network lives in ./blockchain (network_setup.sh + deploy.sh),
+      # brought up separately. This just needs to reach it: same docker
+      # network as the peer/orderer, plus that org's Admin identity mounted
+      # read-only below.
+      FABRIC_PEER_ENDPOINT: peer0.org1.smartfarm.com:7051
+      FABRIC_PEER_HOST_ALIAS: peer0.org1.smartfarm.com
+      FABRIC_MSP_ID: Org1MSP
+      FABRIC_CHANNEL: txchannel
+      FABRIC_CHAINCODE: txanchor
+      FABRIC_MSP_DIR: /fabric-org/users/Admin@org1.smartfarm.com/msp
+      FABRIC_PEER_TLS_CERT: /fabric-org/peers/peer0.org1.smartfarm.com/tls/ca.crt
+      ENABLE_CHAIN_ANCHOR: "true"
+      CHAIN_ANCHOR_INTERVAL_MS: "30000"
+    ports:
+      - "4100:4100"
+    volumes:
+      - ./blockchain/organizations/peerOrganizations/org1.smartfarm.com:/fabric-org:ro
+    networks:
+      - default
+      - fabric_bio
+
+volumes:
+  db-data:
+
+networks:
+  default: {}
+  fabric_bio:
+    external: true

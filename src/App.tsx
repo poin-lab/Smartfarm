@@ -44,7 +44,7 @@ import {
   Wind,
   X,
 } from "lucide-react";
-import { api } from "./api";
+import { api, clearSessionToken, setSessionToken } from "./api";
 import type {
   Container,
   Dashboard,
@@ -60,8 +60,7 @@ import type {
 import { LiveMap } from "./components/LiveMap";
 import { HlsVideo } from "./components/HlsVideo";
 import { AdminOperations } from "./components/AdminOperations";
-import { WalletLink } from "./components/WalletLink";
-import { PublicMarketplace } from "./components/PublicMarketplace";
+import { tradingLimits, validPositiveInt } from "./tradingLimits";
 
 type Route = { page: string; id?: string };
 const won = (value: number) => `${value.toLocaleString("ko-KR")}원`;
@@ -228,17 +227,19 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
     try {
       if (mode === "signup" && password !== confirmPassword)
         throw new Error("비밀번호 확인이 일치하지 않습니다.");
-      const result = await api<{ user: User; expiresAt: string }>(
-        mode === "login" ? "/auth/login" : "/auth/signup",
-        {
-          method: "POST",
-          body: JSON.stringify(
-            mode === "login"
-              ? { email, password }
-              : { name, phone, email, password },
-          ),
-        },
-      );
+      const result = await api<{
+        user: User;
+        expiresAt: string;
+        sessionToken: string;
+      }>(mode === "login" ? "/auth/login" : "/auth/signup", {
+        method: "POST",
+        body: JSON.stringify(
+          mode === "login"
+            ? { email, password }
+            : { name, phone, email, password },
+        ),
+      });
+      setSessionToken(result.sessionToken);
       onLogin(result.user);
     } catch (err) {
       setError((err as Error).message);
@@ -853,19 +854,70 @@ function MapPage({ go }: { go: (p: string, id?: string) => void }) {
   );
 }
 
-function MyFarmPage({ go }: { go: (p: string, id?: string) => void }) {
+function MyFarmPage({
+  go,
+  user,
+}: {
+  go: (p: string, id?: string) => void;
+  user: User;
+}) {
   const [query, setQuery] = useState("");
   const { data, error } = useLoad<Container[]>(
-    `/containers?q=${encodeURIComponent(query)}`,
+    `/containers?owner=me&q=${encodeURIComponent(query)}`,
   );
-  const farmCount = new Set(data?.map((item) => item.farmId)).size;
-  const healthyRate = data?.length
+  const owned = data?.filter((item) => item.viewerIsOwner) || [];
+  const invested = data?.filter((item) => !item.viewerIsOwner) || [];
+  const farmCount = new Set(owned.map((item) => item.farmId)).size;
+  const healthyRate = owned.length
     ? Math.round(
-        (data.filter((item) => !item.status.includes("점검")).length /
-          data.length) *
+        (owned.filter((item) => !item.status.includes("점검")).length /
+          owned.length) *
           100,
       )
     : 0;
+  const renderCard = (c: Container) => (
+    <article
+      className="farm-card"
+      key={c.id}
+      onClick={() => go("container", c.id)}
+    >
+      <div className="farm-visual">
+        <Sprout />
+        <Status value={c.status} />
+        <span>{c.cropName}</span>
+      </div>
+      <div className="farm-card-body">
+        <small>{c.farm?.name}</small>
+        <h2>{c.name}</h2>
+        <p>{c.description}</p>
+        <div className="farm-card-role">
+          {c.viewerIsOwner ? (
+            <span className="role-badge role-owner">
+              <Warehouse aria-hidden="true" />
+              운영 중
+            </span>
+          ) : (
+            <span className="role-badge role-investor">
+              <Coins aria-hidden="true" />
+              보유 토큰 {c.viewerHoldingQuantity ?? 0}개
+            </span>
+          )}
+        </div>
+        <div>
+          <span>
+            예상 수확일<b>{c.harvestAt || "미정"}</b>
+          </span>
+          <span>
+            토큰 가격<b>{won(c.tokenPrice)}</b>
+          </span>
+        </div>
+        <button>
+          <span>환경 데이터 확인</span>
+          <ChevronRight aria-hidden="true" />
+        </button>
+      </div>
+    </article>
+  );
   return (
     <>
       <Header
@@ -887,55 +939,57 @@ function MyFarmPage({ go }: { go: (p: string, id?: string) => void }) {
         <div>
           <Warehouse />
           <span>
-            연결된 농장<strong>{farmCount}개소</strong>
+            운영 중인 농장<strong>{farmCount}개소</strong>
           </span>
         </div>
         <div>
           <Boxes />
           <span>
-            전체 컨테이너<strong>{data?.length || 0}동</strong>
+            운영 중인 컨테이너<strong>{owned.length}동</strong>
+          </span>
+        </div>
+        <div>
+          <Coins />
+          <span>
+            투자한 컨테이너<strong>{invested.length}동</strong>
           </span>
         </div>
         <div>
           <Activity />
           <span>
-            정상 가동률<strong>{healthyRate}%</strong>
+            운영 정상 가동률<strong>{healthyRate}%</strong>
           </span>
         </div>
       </div>
-      <div className="card-grid">
-        {data?.map((c) => (
-          <article
-            className="farm-card"
-            key={c.id}
-            onClick={() => go("container", c.id)}
-          >
-            <div className="farm-visual">
-              <Sprout />
-              <Status value={c.status} />
-              <span>{c.cropName}</span>
+      {owned.length > 0 && (
+        <>
+          <div className="section-title">
+            <div>
+              <p>OPERATING</p>
+              <h2>내가 운영하는 농장</h2>
             </div>
-            <div className="farm-card-body">
-              <small>{c.farm?.name}</small>
-              <h2>{c.name}</h2>
-              <p>{c.description}</p>
-              <div>
-                <span>
-                  예상 수확일<b>{c.harvestAt || "미정"}</b>
-                </span>
-                <span>
-                  토큰 가격<b>{won(c.tokenPrice)}</b>
-                </span>
-              </div>
-              <button>
-                <span>환경 데이터 확인</span>
-                <ChevronRight aria-hidden="true" />
-              </button>
+          </div>
+          <div className="card-grid">{owned.map(renderCard)}</div>
+        </>
+      )}
+      {invested.length > 0 && (
+        <>
+          <div className="section-title">
+            <div>
+              <p>INVESTED</p>
+              <h2>내가 투자한 컨테이너</h2>
             </div>
-          </article>
-        ))}
-      </div>
-      {data?.length === 0 && <Empty>검색 결과가 없습니다.</Empty>}
+          </div>
+          <div className="card-grid">{invested.map(renderCard)}</div>
+        </>
+      )}
+      {data?.length === 0 && (
+        <Empty>
+          {query
+            ? "검색 결과가 없습니다."
+            : `${user.name} 계정이 운영하거나 투자한 농장이 없습니다.`}
+        </Empty>
+      )}
     </>
   );
 }
@@ -1235,6 +1289,24 @@ function ContainerDetail({
   );
   async function submitIssue(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!validPositiveInt(issueSupply, tradingLimits.maxQuantity)) {
+      notify(
+        `발행량은 1~${tradingLimits.maxQuantity.toLocaleString("ko-KR")}개까지 입력해 주세요.`,
+      );
+      return;
+    }
+    if (!validPositiveInt(issuePrice, tradingLimits.maxUnitPrice)) {
+      notify(
+        `초기 참고 가격은 1~${tradingLimits.maxUnitPrice.toLocaleString("ko-KR")}원까지 입력해 주세요.`,
+      );
+      return;
+    }
+    if (issueSupply * issuePrice > tradingLimits.maxOrderTotal) {
+      notify(
+        `총 발행 평가액은 ${tradingLimits.maxOrderTotal.toLocaleString("ko-KR")}원 이하여야 합니다.`,
+      );
+      return;
+    }
     setIssueBusy(true);
     try {
       await api(`/containers/${id}/token-requests`, {
@@ -1434,7 +1506,8 @@ function ContainerDetail({
                 <input
                   type="number"
                   min={1}
-                  value={issueSupply}
+                  max={tradingLimits.maxQuantity}
+                  value={issueSupply || ""}
                   onChange={(event) =>
                     setIssueSupply(Number(event.target.value))
                   }
@@ -1446,8 +1519,9 @@ function ContainerDetail({
                 <input
                   type="number"
                   min={1000}
+                  max={tradingLimits.maxUnitPrice}
                   step={1000}
-                  value={issuePrice}
+                  value={issuePrice || ""}
                   onChange={(event) =>
                     setIssuePrice(Number(event.target.value))
                   }
@@ -1477,7 +1551,13 @@ function ContainerDetail({
   );
 }
 
-function MarketPage({ notify }: { notify: (m: string) => void }) {
+function MarketPage({
+  notify,
+  user,
+}: {
+  notify: (m: string) => void;
+  user: User;
+}) {
   const [query, setQuery] = useState(""),
     [buy, setBuy] = useState<Order | null>(null),
     [quantity, setQuantity] = useState(1),
@@ -1487,6 +1567,23 @@ function MarketPage({ notify }: { notify: (m: string) => void }) {
   );
   async function purchase() {
     if (!buy) return;
+    if (buy.sellerId === user.id) {
+      notify("자신의 판매 주문은 구매할 수 없습니다.");
+      setBuy(null);
+      return;
+    }
+    if (!validPositiveInt(quantity, buy.remainingQuantity ?? buy.quantity)) {
+      notify(
+        `구매 수량은 1~${buy.remainingQuantity ?? buy.quantity}개여야 합니다.`,
+      );
+      return;
+    }
+    if (buy.unitPrice * quantity > tradingLimits.maxOrderTotal) {
+      notify(
+        `총 거래 금액은 ${tradingLimits.maxOrderTotal.toLocaleString("ko-KR")}원 이하여야 합니다.`,
+      );
+      return;
+    }
     setBuying(true);
     try {
       await api(`/orders/${buy.id}/purchase`, {
@@ -1542,50 +1639,60 @@ function MarketPage({ notify }: { notify: (m: string) => void }) {
         않으며 현재 결제는 실제 원화가 아닌 모의 크레딧입니다.
       </p>
       <ErrorBox message={error} />
-      <PublicMarketplace notify={notify} />
       <div className="order-grid">
-        {data?.map((o) => (
-          <article className="order-card" key={o.id}>
-            <div className="order-top">
-              <span>{o.tokenId}</span>
-              <Status value={o.status} />
-            </div>
-            <div className="order-crop">
-              <Sprout />
-              <div>
-                <small>{o.container?.cropName}</small>
-                <h3>{o.container?.name}</h3>
+        {data?.map((o) => {
+          const ownOrder = o.sellerId === user.id;
+          return (
+            <article className="order-card" key={o.id}>
+              <div className="order-top">
+                <span>{o.tokenId}</span>
+                <Status value={o.status} />
               </div>
-            </div>
-            <dl>
-              <div>
-                <dt>판매자</dt>
-                <dd>{o.sellerName}</dd>
+              <div className="order-crop">
+                <Sprout />
+                <div>
+                  <small>{o.container?.cropName}</small>
+                  <h3>{o.container?.name}</h3>
+                </div>
               </div>
-              <div>
-                <dt>남은 수량</dt>
-                <dd>{o.remainingQuantity ?? o.quantity}개</dd>
+              <dl>
+                <div>
+                  <dt>판매자</dt>
+                  <dd>{o.sellerName}</dd>
+                </div>
+                <div>
+                  <dt>남은 수량</dt>
+                  <dd>{o.remainingQuantity ?? o.quantity}개</dd>
+                </div>
+                <div>
+                  <dt>개당 가격</dt>
+                  <dd>{won(o.unitPrice)}</dd>
+                </div>
+              </dl>
+              <div className="order-total">
+                <span>최소 구매 금액</span>
+                <strong>{won(o.unitPrice)}</strong>
               </div>
-              <div>
-                <dt>개당 가격</dt>
-                <dd>{won(o.unitPrice)}</dd>
-              </div>
-            </dl>
-            <div className="order-total">
-              <span>최소 구매 금액</span>
-              <strong>{won(o.unitPrice)}</strong>
-            </div>
-            <button
-              className="primary-btn"
-              onClick={() => {
-                setBuy(o);
-                setQuantity(1);
-              }}
-            >
-              <ShoppingCart /> 구매하기
-            </button>
-          </article>
-        ))}
+              {ownOrder ? (
+                <div className="order-owned-banner" role="status">
+                  <LockKeyhole />
+                  <span>내 판매 상품</span>
+                </div>
+              ) : (
+                <button
+                  className="primary-btn"
+                  title="이 판매 주문을 구매합니다."
+                  onClick={() => {
+                    setBuy(o);
+                    setQuantity(1);
+                  }}
+                >
+                  <ShoppingCart /> 구매하기
+                </button>
+              )}
+            </article>
+          );
+        })}
       </div>
       {buy && (
         <Modal title="토큰 구매" close={() => setBuy(null)}>
@@ -1602,8 +1709,11 @@ function MarketPage({ notify }: { notify: (m: string) => void }) {
             <input
               type="number"
               min={1}
-              max={buy.remainingQuantity ?? buy.quantity}
-              value={quantity}
+              max={Math.min(
+                buy.remainingQuantity ?? buy.quantity,
+                tradingLimits.maxQuantity,
+              )}
+              value={quantity || ""}
               onChange={(e) => setQuantity(Number(e.target.value))}
             />
           </label>
@@ -1656,6 +1766,27 @@ function WalletPage({
     : 0;
   async function submitSell() {
     if (!sell) return;
+    const available = sell.availableQuantity ?? sell.quantity;
+    if (
+      !validPositiveInt(qty, Math.min(available, tradingLimits.maxQuantity))
+    ) {
+      notify(
+        `판매 수량은 1~${available.toLocaleString("ko-KR")}개여야 합니다.`,
+      );
+      return;
+    }
+    if (!validPositiveInt(price, tradingLimits.maxUnitPrice)) {
+      notify(
+        `개당 가격은 1~${tradingLimits.maxUnitPrice.toLocaleString("ko-KR")}원까지 입력해 주세요.`,
+      );
+      return;
+    }
+    if (qty * price > tradingLimits.maxOrderTotal) {
+      notify(
+        `총 거래 금액은 ${tradingLimits.maxOrderTotal.toLocaleString("ko-KR")}원 이하여야 합니다.`,
+      );
+      return;
+    }
     setSelling(true);
     try {
       await api("/orders", {
@@ -1879,8 +2010,11 @@ function WalletPage({
               <input
                 type="number"
                 min={1}
-                max={sell.availableQuantity ?? sell.quantity}
-                value={qty}
+                max={Math.min(
+                  sell.availableQuantity ?? sell.quantity,
+                  tradingLimits.maxQuantity,
+                )}
+                value={qty || ""}
                 onChange={(e) => setQty(Number(e.target.value))}
               />
             </label>
@@ -1889,8 +2023,9 @@ function WalletPage({
               <input
                 type="number"
                 min={1000}
+                max={tradingLimits.maxUnitPrice}
                 step={1000}
-                value={price}
+                value={price || ""}
                 onChange={(e) => setPrice(Number(e.target.value))}
               />
             </label>
@@ -2377,7 +2512,6 @@ function ProfilePage({
           </form>
         </div>
       </div>
-      <WalletLink user={user} update={update} />
     </>
   );
 }
@@ -2427,6 +2561,7 @@ export default function App() {
   }, []);
   useEffect(() => {
     const expired = () => {
+      clearSessionToken();
       setUser(null);
       setRoute({ page: "dashboard" });
     };
@@ -2446,6 +2581,7 @@ export default function App() {
     try {
       await api("/auth/logout", { method: "POST" });
     } catch {}
+    clearSessionToken();
     setUser(null);
     setRoute({ page: "dashboard" });
   };
@@ -2455,14 +2591,15 @@ export default function App() {
   if (route.page === "dashboard")
     page = <DashboardPage go={go} notify={setToast} />;
   else if (route.page === "map") page = <MapPage go={go} />;
-  else if (route.page === "myfarm") page = <MyFarmPage go={go} />;
+  else if (route.page === "myfarm") page = <MyFarmPage go={go} user={user} />;
   else if (route.page === "farm" && route.id)
     page = <FarmDetail id={route.id} go={go} />;
   else if (route.page === "container" && route.id)
     page = (
       <ContainerDetail id={route.id} go={go} user={user} notify={setToast} />
     );
-  else if (route.page === "market") page = <MarketPage notify={setToast} />;
+  else if (route.page === "market")
+    page = <MarketPage notify={setToast} user={user} />;
   else if (route.page === "wallet")
     page = <WalletPage notify={setToast} go={go} />;
   else if (route.page === "admin" && user.role === "admin")

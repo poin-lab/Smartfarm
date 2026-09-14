@@ -1,5 +1,3 @@
-import { resolve } from "node:path";
-
 try {
   process.loadEnvFile?.(".env");
 } catch (error) {
@@ -17,23 +15,25 @@ export const config = Object.freeze({
   env: process.env.NODE_ENV || "development",
   host: process.env.HOST || "0.0.0.0",
   port: int("PORT", 4100, 1, 65535),
-  databasePath: process.env.SMARTFARM_DB
-    ? resolve(process.env.SMARTFARM_DB)
-    : undefined,
+  databaseUrl: process.env.DATABASE_URL,
   trustProxy: process.env.TRUST_PROXY === "true",
   sessionHours: int("SESSION_HOURS", 12, 1, 720),
 });
 
 export function assertProductionSecrets() {
+  if (!config.databaseUrl)
+    throw new Error(
+      "DATABASE_URL is required (set it in .env, e.g. postgres://user:pass@localhost:5432/green_link).",
+    );
   if (config.env !== "production") return;
   if ((process.env.LOGIN_ACCOUNT_SOURCE || "database") !== "database")
     throw new Error("Production requires LOGIN_ACCOUNT_SOURCE=database.");
   if (
-    !process.env.BLOCKCHAIN_SIGNING_KEY ||
-    process.env.BLOCKCHAIN_SIGNING_KEY.length < 32
+    !process.env.LEDGER_SIGNING_KEY ||
+    process.env.LEDGER_SIGNING_KEY.length < 32
   ) {
     throw new Error(
-      "Production requires BLOCKCHAIN_SIGNING_KEY with at least 32 characters.",
+      "Production requires LEDGER_SIGNING_KEY with at least 32 characters.",
     );
   }
 }

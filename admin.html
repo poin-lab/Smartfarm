@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>GREEN LINK admin console (dev only)</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f0c;
+    --panel: #0f1611;
+    --border: #1f2e22;
+    --fg: #c9f5d3;
+    --dim: #5f8f6d;
+    --accent: #35d07f;
+    --err: #ff6b6b;
+    --chain: #7fb8ff;
+    --trade: #ffd166;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 13px;
+    display: flex;
+    height: 100vh;
+  }
+  aside {
+    width: 260px;
+    flex: none;
+    border-right: 1px solid var(--border);
+    padding: 14px;
+    overflow-y: auto;
+  }
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  h1 {
+    font-size: 13px;
+    margin: 0 0 12px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .field { margin-bottom: 10px; }
+  label { display: block; color: var(--dim); margin-bottom: 3px; }
+  input, select {
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 6px 8px;
+    font: inherit;
+    border-radius: 3px;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  button {
+    display: block;
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 8px;
+    margin-top: 8px;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #status {
+    padding: 6px 8px;
+    margin: 10px 0;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    font-size: 12px;
+    word-break: break-all;
+  }
+  #status.ok { color: var(--accent); border-color: var(--accent); }
+  .ok { color: var(--accent); }
+  .err { color: var(--err); }
+  #status.err { color: var(--err); border-color: var(--err); }
+  .group { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 10px; }
+  .group h2 {
+    font-size: 11px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0 0 6px;
+  }
+  #topbar {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--dim);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex: none;
+    gap: 12px;
+  }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+  .tab {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--dim);
+    padding: 4px 10px;
+    width: auto;
+    margin: 0;
+    border-radius: 3px;
+  }
+  .tab.active { color: var(--accent); border-color: var(--accent); }
+  .view { flex: 1; overflow-y: auto; padding: 14px; display: none; }
+  .view.active { display: block; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td {
+    text-align: left;
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    white-space: nowrap;
+  }
+  th { color: var(--dim); position: sticky; top: 0; background: var(--bg); }
+  tr:hover td { background: var(--panel); }
+  .tag {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    font-size: 10px;
+    text-transform: uppercase;
+  }
+  .tag.AUDIT { color: var(--fg); }
+  .tag.CHAIN { color: var(--chain); border-color: var(--chain); }
+  .tag.LEDGER { color: var(--accent); border-color: var(--accent); }
+  .tag.TRADE { color: var(--trade); border-color: var(--trade); }
+  .muted { color: var(--dim); }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; }
+  .toolbar button, .toolbar select { width: auto; margin: 0; }
+  .toolbar label { display: flex; align-items: center; gap: 4px; color: var(--dim); }
+  .tablewrap { overflow-x: auto; }
+
+  #log { white-space: pre-wrap; word-break: break-all; }
+  .entry { margin-bottom: 16px; }
+  .entry .meta { color: var(--dim); }
+  .entry .meta.err { color: var(--err); }
+  .entry pre {
+    margin: 4px 0 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 8px;
+    overflow-x: auto;
+  }
+</style>
+</head>
+<body>
+<aside>
+  <h1>GREEN LINK / admin</h1>
+  <div class="field">
+    <label>API base</label>
+    <input id="base" value="http://localhost:4100" />
+  </div>
+  <div class="field">
+    <label>admin email</label>
+    <input id="email" value="admin@smartfarm.kr" />
+  </div>
+  <div class="field">
+    <label>password</label>
+    <input id="password" type="password" value="admin1234" />
+  </div>
+  <button id="login">로그인</button>
+  <div id="status">로그인 필요</div>
+
+  <div class="group">
+    <h2>새로고침</h2>
+    <button id="refreshAll">전체 새로고침</button>
+    <label style="display:flex;align-items:center;gap:6px;color:var(--dim);margin-top:8px;">
+      <input type="checkbox" id="autoRefresh" style="width:auto;" checked />
+      10초마다 자동 새로고침
+    </label>
+  </div>
+
+  <div class="group">
+    <h2>블록체인 앵커링 (Fabric)</h2>
+    <button data-call="anchorRun">지금 바로 앵커링 실행</button>
+  </div>
+
+  <div class="group">
+    <h2>Raw 콘솔</h2>
+    <button data-call="health">GET /api/health</button>
+    <button data-call="ledgerVerify">GET /api/ledger/verify</button>
+    <button id="clear">Raw 콘솔 지우기</button>
+  </div>
+</aside>
+<main>
+  <div id="topbar">
+    <span>dev-only console — src/, dist/, Docker 이미지에 포함되지 않음</span>
+    <div class="tabs">
+      <button class="tab active" data-tab="timeline">통합 로그</button>
+      <button class="tab" data-tab="trades">거래내역</button>
+      <button class="tab" data-tab="accounts">계정</button>
+      <button class="tab" data-tab="dbbrowser">DB 테이블</button>
+      <button class="tab" data-tab="console">Raw 콘솔</button>
+    </div>
+    <span id="clock"></span>
+  </div>
+
+  <div id="timelineView" class="view active">
+    <div class="toolbar">
+      <span class="muted">로그인/거래/체인 앵커링/내부 원장을 시간순으로 전부 합쳐서 보여줍니다 (전체 유저 대상, 관리자로만 필터하지 않음).</span>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>시각</th><th>구분</th><th>내용</th></tr></thead>
+        <tbody id="timelineBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tradesView" class="view">
+    <div class="toolbar">
+      <span class="muted">누가 뭘 얼마에 사고팔았는지 전부. 오른쪽 끝에 블록체인 앵커링 상태/블록 번호 표시.</span>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>시각</th><th>토큰</th><th>수량</th><th>단가</th><th>총액</th>
+            <th>구매자</th><th>판매자</th><th>앵커 상태</th><th>Fabric 블록</th><th>tx</th>
+          </tr>
+        </thead>
+        <tbody id="tradesBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="accountsView" class="view">
+    <div class="toolbar">
+      <span class="muted">
+        비밀번호는 해시라 원본을 복구할 수 없음 — 아래는 <b>seed에 원래 심어둔 값</b>이라 누가
+        바꿨으면 안 맞을 수 있음. 안 맞으면 그 아래 강제 재설정으로 바로 고치면 됨.
+      </span>
+    </div>
+    <h3 style="font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;">
+      데모 계정 (server/seed.js 기준, API로 불러옴)
+    </h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>역할</th><th>이메일</th><th>seed 시점 비밀번호</th></tr></thead>
+        <tbody id="demoAccountsBody"></tbody>
+      </table>
+    </div>
+
+    <h3 style="font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin-top:20px;">
+      비밀번호 강제 재설정 (기존 비번 몰라도 됨, 모든 세션 로그아웃됨)
+    </h3>
+    <div class="toolbar">
+      <select id="resetUserSelect" style="max-width:320px;"></select>
+      <input id="resetNewPassword" type="text" placeholder="새 비밀번호 (8자 이상)" style="max-width:220px;" />
+      <button id="resetPasswordBtn">재설정</button>
+      <span class="muted" id="resetStatus"></span>
+    </div>
+  </div>
+
+  <div id="dbbrowserView" class="view">
+    <div class="toolbar">
+      <label>테이블</label>
+      <select id="tableSelect"></select>
+      <button id="loadTable">불러오기</button>
+      <span class="muted" id="tableInfo"></span>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead id="dbTableHead"></thead>
+        <tbody id="dbTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="consoleView" class="view">
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const log = $("log");
+  const statusEl = $("status");
+  let token = "";
+  let autoTimer = null;
+
+  const setStatus = (text, ok) => {
+    statusEl.textContent = text;
+    statusEl.className = ok === undefined ? "" : ok ? "ok" : "err";
+  };
+
+  const clockTick = () => {
+    $("clock").textContent = new Date().toLocaleTimeString("ko-KR");
+  };
+  setInterval(clockTick, 1000);
+  clockTick();
+
+  // ---- tabs ----
+  document.querySelectorAll(".tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+      document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
+      tab.classList.add("active");
+      $(tab.dataset.tab + "View").classList.add("active");
+    });
+  });
+
+  // ---- raw console ----
+  const print = (title, data, isError) => {
+    const entry = document.createElement("div");
+    entry.className = "entry";
+    const meta = document.createElement("div");
+    meta.className = "meta" + (isError ? " err" : "");
+    meta.textContent = `[${new Date().toLocaleTimeString("ko-KR")}] ${title}`;
+    const pre = document.createElement("pre");
+    pre.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    entry.appendChild(meta);
+    entry.appendChild(pre);
+    log.appendChild(entry);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  const base = () => $("base").value.replace(/\/$/, "");
+
+  const call = async (method, path, body, { silent } = {}) => {
+    const headers = { Accept: "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (body) headers["Content-Type"] = "application/json";
+    if (method !== "GET") headers["X-Green-Link-Request"] = "1";
+    let response;
+    try {
+      response = await fetch(base() + path, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (error) {
+      if (!silent) print(`${method} ${path} — network error`, String(error), true);
+      throw error;
+    }
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (!silent) print(`${method} ${path} — ${response.status}`, data, !response.ok);
+    if (!response.ok) throw new Error(data?.message || response.status);
+    return data;
+  };
+
+  $("login").addEventListener("click", async () => {
+    setStatus("로그인 중...");
+    try {
+      const data = await call("POST", "/api/auth/login", {
+        email: $("email").value,
+        password: $("password").value,
+      });
+      token = data.sessionToken;
+      setStatus(`로그인됨: ${data.user.name} (${data.user.role})`, true);
+      await loadTableList();
+      await loadUserSelect();
+      await loadDemoAccounts();
+      refreshAll();
+    } catch {
+      token = "";
+      setStatus("로그인 실패", false);
+    }
+  });
+
+  $("clear").addEventListener("click", () => {
+    log.innerHTML = "";
+  });
+
+  const actions = {
+    health: () => call("GET", "/api/health"),
+    ledgerVerify: () => call("GET", "/api/ledger/verify"),
+    anchorRun: () =>
+      call("POST", "/api/admin/chain-anchor/run").then(() => refreshAll()),
+  };
+  document.querySelectorAll("[data-call]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = actions[button.dataset.call];
+      if (action) action().catch(() => {});
+    });
+  });
+
+  // ---- helpers ----
+  const short = (value, n = 14) =>
+    value ? (String(value).length > n ? String(value).slice(0, n) + "…" : value) : "";
+  const money = (n) => (typeof n === "number" ? n.toLocaleString("ko-KR") : n ?? "");
+  const fmtTime = (t) => (t ? new Date(t).toLocaleString("ko-KR") : "");
+
+  // ---- 거래내역 ----
+  async function refreshTrades() {
+    let rows = [];
+    try {
+      rows = await call("GET", "/api/admin/executions?limit=300", null, { silent: true });
+    } catch (error) {
+      setStatus(`거래내역 갱신 실패: ${error.message}`, false);
+      return;
+    }
+    const body = $("tradesBody");
+    body.innerHTML = "";
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      const anchorTag =
+        r.anchorStatus === "confirmed"
+          ? `<span class="tag CHAIN">CONFIRMED</span>`
+          : r.anchorStatus === "failed"
+            ? `<span class="tag" style="color:var(--err);border-color:var(--err)">FAILED</span>`
+            : `<span class="tag muted">PENDING</span>`;
+      tr.innerHTML =
+        `<td>${fmtTime(r.executedAt)}</td>` +
+        `<td>${r.tokenId}</td>` +
+        `<td>${r.quantity}</td>` +
+        `<td>${money(r.unitPrice)}</td>` +
+        `<td>${money(r.totalAmount)}</td>` +
+        `<td>${r.buyerName}<br><span class="muted">${r.buyerEmail}</span></td>` +
+        `<td>${r.sellerName}<br><span class="muted">${r.sellerEmail}</span></td>` +
+        `<td>${anchorTag}</td>` +
+        `<td>${r.blockNumber ?? "-"}</td>` +
+        `<td class="muted">${short(r.txHash, 12)}</td>`;
+      body.appendChild(tr);
+    }
+    return rows;
+  }
+
+  // ---- 통합 로그 ----
+  async function refreshTimeline(tradesCache) {
+    let audits = [], batches = [], blocks = [];
+    try {
+      [audits, batches, blocks] = await Promise.all([
+        call("GET", "/api/admin/audit-logs?limit=150", null, { silent: true }),
+        call("GET", "/api/admin/chain-anchor/batches?limit=100", null, { silent: true }),
+        call("GET", "/api/ledger/blocks?limit=100", null, { silent: true }),
+      ]);
+    } catch (error) {
+      setStatus(`통합 로그 갱신 실패: ${error.message}`, false);
+      return;
+    }
+    const trades = tradesCache || (await refreshTrades()) || [];
+
+    const entries = [];
+    for (const t of trades)
+      entries.push({
+        time: t.executedAt,
+        type: "TRADE",
+        html:
+          `<b>${t.buyerName}</b>가 <b>${t.sellerName}</b>로부터 ${t.tokenId} ${t.quantity}개 구매 ` +
+          `(단가 ${money(t.unitPrice)}, 총 ${money(t.totalAmount)}) ` +
+          `<span class="muted">[앵커: ${t.anchorStatus}${t.blockNumber != null ? ", 블록 #" + t.blockNumber : ""}]</span>`,
+      });
+    for (const a of audits)
+      entries.push({
+        time: a.createdAt,
+        type: "AUDIT",
+        html: `<b>${a.actorName || a.actorEmail || a.actorId || "system"}</b> — ${a.action} <span class="muted">(${a.entityType}:${short(a.entityId, 10)})</span>`,
+      });
+    for (const b of batches)
+      entries.push({
+        time: b.createdAt,
+        type: "CHAIN",
+        html:
+          `거래 ${b.executionCount}건 앵커링 (${short(b.fromExecutionId, 8)}~${short(b.toExecutionId, 8)}) ` +
+          `→ Fabric <b>블록 #${b.blockNumber ?? "?"}</b>, tx=${short(b.txHash, 16)}, merkle=${short(b.merkleRoot, 16)} ` +
+          `<span class="muted">[${b.status}]</span>` +
+          (b.errorMessage ? ` <span style="color:var(--err)">${b.errorMessage}</span>` : ""),
+      });
+    for (const bl of blocks)
+      entries.push({
+        time: bl.createdAt,
+        type: "LEDGER",
+        html: `내부 원장 height=<b>${bl.height}</b> ${bl.eventType} <span class="muted">(${bl.entityType}:${short(bl.entityId, 10)})</span>`,
+      });
+
+    entries.sort((a, b) => new Date(b.time) - new Date(a.time));
+
+    const body = $("timelineBody");
+    body.innerHTML = "";
+    for (const entry of entries) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td class="muted">${fmtTime(entry.time)}</td><td><span class="tag ${entry.type}">${entry.type}</span></td><td>${entry.html}</td>`;
+      body.appendChild(tr);
+    }
+    setStatus(`${entries.length}건 로드됨 (${new Date().toLocaleTimeString("ko-KR")} 기준)`, true);
+  }
+
+  async function refreshAll() {
+    if (!token) return;
+    const trades = await refreshTrades();
+    await refreshTimeline(trades);
+  }
+  $("refreshAll").addEventListener("click", refreshAll);
+  $("autoRefresh").addEventListener("change", (e) => {
+    clearInterval(autoTimer);
+    if (e.target.checked) autoTimer = setInterval(refreshAll, 10000);
+  });
+  autoTimer = setInterval(refreshAll, 10000);
+
+  // ---- 계정 / 비밀번호 재설정 ----
+  async function loadDemoAccounts() {
+    let accounts = [];
+    try {
+      accounts = await call("GET", "/api/admin/demo-accounts", null, { silent: true });
+    } catch {
+      return;
+    }
+    const body = $("demoAccountsBody");
+    body.innerHTML = "";
+    for (const a of accounts) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${a.label}</td><td>${a.email}</td><td>${a.password}</td>`;
+      body.appendChild(tr);
+    }
+  }
+  async function loadUserSelect() {
+    let users = [];
+    try {
+      users = await call("GET", "/api/admin/users?limit=200", null, { silent: true });
+    } catch {
+      return;
+    }
+    const select = $("resetUserSelect");
+    select.innerHTML = "";
+    for (const u of users) {
+      const opt = document.createElement("option");
+      opt.value = u.id;
+      opt.textContent = `${u.name} <${u.email}> [${u.role}]`;
+      select.appendChild(opt);
+    }
+  }
+  $("resetPasswordBtn").addEventListener("click", async () => {
+    const userId = $("resetUserSelect").value;
+    const newPassword = $("resetNewPassword").value;
+    if (!userId) return;
+    $("resetStatus").textContent = "처리 중...";
+    $("resetStatus").className = "muted";
+    try {
+      await call("POST", `/api/admin/users/${userId}/reset-password`, { newPassword });
+      $("resetStatus").textContent = "재설정 완료 (기존 로그인 세션 전부 만료됨)";
+      $("resetStatus").className = "ok";
+      $("resetNewPassword").value = "";
+    } catch (error) {
+      $("resetStatus").textContent = `실패: ${error.message}`;
+      $("resetStatus").className = "err";
+    }
+  });
+
+  // ---- DB 테이블 브라우저 ----
+  async function loadTableList() {
+    try {
+      const tables = await call("GET", "/api/admin/db/tables", null, { silent: true });
+      const select = $("tableSelect");
+      select.innerHTML = "";
+      for (const t of tables) {
+        const opt = document.createElement("option");
+        opt.value = t;
+        opt.textContent = t;
+        select.appendChild(opt);
+      }
+    } catch {
+      // login first
+    }
+  }
+  async function loadTable() {
+    const table = $("tableSelect").value;
+    if (!table) return;
+    let rows;
+    try {
+      rows = await call("GET", `/api/admin/db/${table}?limit=200`, null, { silent: true });
+    } catch (error) {
+      $("tableInfo").textContent = `실패: ${error.message}`;
+      return;
+    }
+    const head = $("dbTableHead");
+    const body = $("dbTableBody");
+    head.innerHTML = "";
+    body.innerHTML = "";
+    $("tableInfo").textContent = `${rows.length}행`;
+    if (!rows.length) return;
+    const columns = Object.keys(rows[0]);
+    const tr = document.createElement("tr");
+    tr.innerHTML = columns.map((c) => `<th>${c}</th>`).join("");
+    head.appendChild(tr);
+    for (const row of rows) {
+      const rowEl = document.createElement("tr");
+      rowEl.innerHTML = columns
+        .map((c) => {
+          const value = row[c];
+          const text = value && typeof value === "object" ? JSON.stringify(value) : String(value ?? "");
+          return `<td title="${text.replace(/"/g, "&quot;")}">${short(text, 40)}</td>`;
+        })
+        .join("");
+      body.appendChild(rowEl);
+    }
+  }
+  $("loadTable").addEventListener("click", loadTable);
+})();
+</script>
+</body>
+</html>

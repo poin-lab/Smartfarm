@@ -1,0 +1,11 @@
+{
+    "index": {
+        "fields": [
+            "docType",
+            "created_at_ms"
+        ]
+    },
+    "ddoc": "indexTxBatchSorted",
+    "name": "indexTxBatchSorted",
+    "type": "json"
+}
